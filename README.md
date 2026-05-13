@@ -1,0 +1,168 @@
+# libfex
+
+A modern C++23 library for writing **fusex** filesystem daemons.
+
+`fusex` is a kernel-side variant of FUSE introduced by the patches at
+`fs/fuse/fusex.c` in the linked kernel tree. It speaks a leaner dialect
+of the FUSE wire protocol — four new opcodes
+(`LOOKUP_ROOT`, `LOOKUPX`, `MKOBJX`, `SETSTATX`), `FUSE_STATX`, no
+`FUSE_OPEN` for regular files, mandatory synchronous INIT, mounted via
+`fsopen`/`fsconfig`/`fsmount` only — and rejects regular libfuse
+daemons. This library is the userspace counterpart.
+
+It is *not* a thin wrapper around libfuse 3. There is no `struct
+fuse_operations` of function pointers, no `void *user_data`, no signal
+handling magic, and no command-line option parser. You inherit one
+class:
+
+```cpp
+class fex::Filesystem {
+    virtual std::expected<EntryOut,  Errc> lookup_root(const Context&)              = 0;
+    virtual std::expected<EntryOut,  Errc> lookupx(const Context&, NodeId, std::string_view) = 0;
+    virtual std::expected<StatxOut,  Errc> statx(const Context&, NodeId)            = 0;
+    // ... default-implemented (-ENOSYS) callbacks for everything else
+};
+```
+
+…and pass an instance to `fex::Session::run()`. Errors are
+`std::expected<T, std::errc>`. Buffers are `std::span<std::byte>`. RAII
+owns every fd.
+
+## Status
+
+Functional, multi-threaded over FUSE-over-io_uring. Implements the
+full opcode set the kernel module currently emits:
+lookup/statx/setstatx/mkobjx, unlink/rmdir/rename2/link,
+read/write/readlink, opendir/releasedir/readdir, statfs, fallocate,
+getxattr/setxattr/listxattr/removexattr, plus INIT negotiation.
+Includes a worked passthrough example.
+
+Threading: the session spawns `SessionOptions::uring_queues` worker
+threads (default = `hardware_concurrency()`, clamped to [1,32]), each
+owning one io_uring with `uring_queue_depth` pre-registered entries.
+The mount-time handshake (INIT/LOOKUP_ROOT/STATX) runs on a temporary
+`read()/writev()` path because the kernel won't accept ring
+registration before INIT; everything afterwards is io_uring only.
+Filesystem callbacks may run concurrently — implementations must be
+thread-safe.
+
+Not yet wired up: FUSE notifications (the `FUSE_OVER_IO_URING_NOTIFY`
+path from `fusex-uring-notify.patch`), FORGET (the kernel doesn't
+emit it for fusex yet — server-driven invalidation via
+`FUSE_NOTIFY_INVAL_*`).
+
+Note that at the moment of this writing fusex is not upstream and
+needs a patch to send all operation exclusively over io-uring.
+
+## Requirements
+
+* gcc 13+ or clang 17+ (`std::expected`, designated init, C++23)
+* Linux kernel with `fusex` filesystem registered
+  (`grep fusex /proc/filesystems` should show it) and
+  FUSE-over-io_uring support (Linux 6.10+)
+* liburing 2.5+ (`pkg-config --modversion liburing`)
+* `/dev/fuse` accessible
+
+## Build
+
+Either:
+
+```sh
+make -j$(nproc)            # → build/libfex.{a,so,so.0,so.0.1.0}, build/fex-passthrough
+sudo make install          # → /usr/local
+```
+
+Or with CMake (>= 3.20):
+
+```sh
+cmake -S . -B build -G Ninja
+cmake --build build
+sudo cmake --install build
+```
+
+## Use
+
+```cpp
+#include <fex/fex.hpp>
+
+class MyFs : public fex::Filesystem {
+    std::expected<fex::EntryOut, fex::Errc>
+    lookup_root(const fex::Context&) override {
+        return fex::EntryOut{
+            .nodeid = fex::NodeId::root,
+            .entry_valid = std::chrono::seconds(1),
+        };
+    }
+    std::expected<fex::EntryOut, fex::Errc>
+    lookupx(const fex::Context&, fex::NodeId parent,
+            std::string_view name) override { /* ... */ }
+    std::expected<fex::StatxOut, fex::Errc>
+    statx(const fex::Context&, fex::NodeId) override { /* ... */ }
+};
+
+int main() {
+    MyFs fs;
+    fex::Session s({.mountpoint = "/mnt/myfs"});
+    return s.run(fs).value();
+}
+```
+
+Compile with `-std=c++23 -lfex -lpthread -luring`.
+
+## Passthrough example
+
+```sh
+mkdir -p /tmp/backing /tmp/mnt
+echo hello > /tmp/backing/greeting
+
+# In one terminal:
+build/fex-passthrough /tmp/backing /tmp/mnt
+
+# In another:
+ls -la /tmp/mnt
+cat /tmp/mnt/greeting
+```
+
+The example daemon mirrors `<backing_dir>` byte-for-byte: every fusex
+callback runs the equivalent `*at()` syscall against an `O_PATH` fd of
+the backing directory. Inode numbers from the backing fs are reused as
+fusex nodeids.
+
+To unmount:
+
+```sh
+sudo umount /tmp/mnt
+```
+
+…or kill the daemon — the kernel will see `read(/dev/fuse) == 0` and
+the session loop returns cleanly.
+
+## Design notes — why not libfuse?
+
+The fusex kernel module diverges from upstream FUSE in several ways
+that make a fresh library cheaper than reshaping libfuse:
+
+* **No `FUSE_OPEN`.** The kernel issues `FUSE_READ`/`FUSE_WRITE`
+  directly against a nodeid, no per-open file handle. libfuse's
+  `fi->fh` plumbing has nothing to track.
+* **`FUSE_LOOKUP_ROOT` happens during mount.** The daemon must answer
+  it (and the immediate follow-up `FUSE_STATX`) inside
+  `fsconfig(CMD_CREATE)`. Our `Session::run()` spawns the mount on a
+  helper thread so the main thread can service these in time.
+* **`FUSE_MKOBJX`** collapses CREATE/MKDIR/MKNOD/SYMLINK/TMPFILE into
+  one opcode keyed on `mode & S_IFMT`. We expose it as a single
+  `mkobjx()` callback rather than five.
+* **`FUSE_LINK` reply must be empty** — see `fusex-review.md` item 5b.
+  Our `link()` returns `std::expected<void, Errc>`, not an `EntryOut`.
+* **Server-driven invalidation.** The kernel ignores `entry_valid` /
+  `attr_valid` timeouts; daemons must emit `FUSE_NOTIFY_INVAL_*` to
+  invalidate. (Notify-out is on the to-do list above.)
+* **Sync-INIT is mandatory.** `FUSE_DEV_IOC_SYNC_INIT` must be issued
+  on the `/dev/fuse` fd before passing it to `fsconfig`.
+  `fex::open_fex_device()` does this for you.
+
+## Licensing
+
+`include/fex/abi.h` is BSD-2-Clause OR GPL-2.0 (kernel UAPI). The
+rest is BSD-2-Clause OR GPL-2.0 at the user's choice — same dual
+license libfuse uses.
