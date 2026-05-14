@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <unistd.h>
 
 namespace fex {
@@ -108,6 +109,40 @@ void Session::stop() noexcept {
 std::error_code Session::run(Filesystem& fs)
 {
     impl_->fs = &fs;
+
+    // Scope guard: on every exit path, if move_mount installed the
+    // fs into the namespace, drop it. Without this, a daemon that
+    // exits (clean stop, signal, crashed worker, …) leaves the
+    // kernel superblock attached to the mountpoint — subsequent
+    // mounts on the same path stack on top, and tools that look the
+    // fs up by source (xfstests' _check_mounted_on, findmnt, …) see
+    // duplicates.
+    //
+    // Critical ordering: close /dev/fuse FIRST so the kernel marks
+    // the FUSE connection aborted. Otherwise umount2() blocks for
+    // minutes waiting on FUSE_DESTROY / dirty-page flushes that our
+    // ring workers (already joined here, rings torn down by their
+    // dtors) can no longer service. With the connection aborted,
+    // kill_sb sees -ENOTCONN immediately and umount returns. We use
+    // MNT_DETACH for the same reason: lazy detach, no blocking on
+    // busy refs.
+    struct UmountOnExit {
+        Impl* impl;
+        ~UmountOnExit() {
+            if (!impl->mount_installed) return;
+            impl->dev_fd.reset();
+            if (::umount2(impl->opts.mountpoint.c_str(), MNT_DETACH) < 0) {
+                const int e = errno;
+                if (e != EINVAL && e != ENOENT) {
+                    std::fprintf(stderr,
+                        "fex umount(%s): errno=%d (%s)\n",
+                        impl->opts.mountpoint.c_str(),
+                        e, ::strerror(e));
+                }
+            }
+            impl->mount_installed = false;
+        }
+    } umount_guard{impl_.get()};
 
     // ---- 1. Acquire dev fd and stop eventfd. -------------------------
     if (impl_->opts.dev_fd >= 0) {

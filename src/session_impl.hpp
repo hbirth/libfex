@@ -114,6 +114,7 @@ struct Session::Impl {
     UniqueFd          stop_efd;          // eventfd workers poll for shutdown
     std::atomic<bool> stopping{false};
     bool              init_done = false; // set when INIT reply has been sent
+    bool              mount_installed = false; // move_mount succeeded; umount on teardown
 
     explicit Impl(SessionOptions o) : opts(std::move(o)) {}
 

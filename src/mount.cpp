@@ -87,6 +87,20 @@ Session::Impl::mount_open_and_set_fd()
                      dev_fd.get(), errno, ::strerror(errno));
         return std::unexpected(std::error_code(errno, std::system_category()));
     }
+
+    // "source" is a VFS-generic key handled by vfs_parse_fs_string before
+    // the filesystem's parse_param sees it; it lands in fc->source and
+    // becomes the first column of /proc/self/mountinfo. Without it the
+    // kernel records "none".
+    if (!opts.source.empty()) {
+        if (sys_fsconfig(fsfd, /*FSCONFIG_SET_STRING*/ 1, "source",
+                         opts.source.c_str(), 0) < 0) {
+            std::fprintf(stderr,
+                "fex mount: fsconfig(SET_STRING, source=%s) -> errno=%d (%s)\n",
+                opts.source.c_str(), errno, ::strerror(errno));
+            return std::unexpected(std::error_code(errno, std::system_category()));
+        }
+    }
     return fsfd_holder;
 }
 
@@ -123,6 +137,11 @@ std::error_code Session::Impl::mount_create_and_finish(UniqueFd fsfd)
                      opts.mountpoint.c_str(), errno, ::strerror(errno));
         return {errno, std::system_category()};
     }
+
+    // Mount now lives in the namespace; Session::run() must umount on
+    // teardown so a crashed/exited daemon doesn't leave stale entries
+    // in /proc/self/mountinfo for the next run.
+    mount_installed = true;
 
     // Once moved into place, the mount fd may be closed; the actual
     // mount persists in the namespace.

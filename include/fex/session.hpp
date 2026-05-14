@@ -78,6 +78,12 @@ struct SessionOptions {
     // Optional human-readable source label (shows in /proc/self/mountinfo).
     std::string fsname = "fex";
 
+    // Mount source string — what appears in the first column of
+    // `mount`(8) / `/proc/self/mountinfo`. If left empty, the kernel
+    // records "none". Typical use is the backing path for passthrough
+    // FSes, or a server URL for network FSes.
+    std::string source;
+
     // Mount the FS read-only.
     bool read_only = false;
 
