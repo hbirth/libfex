@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <vector>
@@ -57,6 +59,57 @@ void pack_statx(const StatxOut& src, std::chrono::nanoseconds attr_valid,
     s.rdev_minor      = src.rdev_minor;
     s.dev_major       = src.dev_major;
     s.dev_minor       = src.dev_minor;
+}
+
+// Same FEX_DEBUG gate the passthrough example uses, evaluated once.
+bool debug_enabled() noexcept {
+    static const bool on = [] {
+        const char* e = std::getenv("FEX_DEBUG");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+const char* opcode_name(std::uint32_t op) noexcept {
+    switch (op) {
+    case FUSE_LOOKUP:        return "LOOKUP";
+    case FUSE_FORGET:        return "FORGET";
+    case FUSE_GETATTR:       return "GETATTR";
+    case FUSE_SETATTR:       return "SETATTR";
+    case FUSE_READLINK:      return "READLINK";
+    case FUSE_SYMLINK:       return "SYMLINK";
+    case FUSE_MKNOD:         return "MKNOD";
+    case FUSE_MKDIR:         return "MKDIR";
+    case FUSE_UNLINK:        return "UNLINK";
+    case FUSE_RMDIR:         return "RMDIR";
+    case FUSE_RENAME:        return "RENAME";
+    case FUSE_LINK:          return "LINK";
+    case FUSE_OPEN:          return "OPEN";
+    case FUSE_READ:          return "READ";
+    case FUSE_WRITE:         return "WRITE";
+    case FUSE_STATFS:        return "STATFS";
+    case FUSE_RELEASE:       return "RELEASE";
+    case FUSE_FSYNC:         return "FSYNC";
+    case FUSE_SETXATTR:      return "SETXATTR";
+    case FUSE_GETXATTR:      return "GETXATTR";
+    case FUSE_LISTXATTR:     return "LISTXATTR";
+    case FUSE_REMOVEXATTR:   return "REMOVEXATTR";
+    case FUSE_FLUSH:         return "FLUSH";
+    case FUSE_INIT:          return "INIT";
+    case FUSE_OPENDIR:       return "OPENDIR";
+    case FUSE_READDIR:       return "READDIR";
+    case FUSE_RELEASEDIR:    return "RELEASEDIR";
+    case FUSE_FSYNCDIR:      return "FSYNCDIR";
+    case FUSE_FALLOCATE:     return "FALLOCATE";
+    case FUSE_RENAME2:       return "RENAME2";
+    case FUSE_STATX:         return "STATX";
+    case FUSE_LOOKUP_ROOT:   return "LOOKUP_ROOT";
+    case FUSE_LOOKUPX:       return "LOOKUPX";
+    case FUSE_MKOBJX:        return "MKOBJX";
+    case FUSE_SETSTATX:      return "SETSTATX";
+    case FUSE_COMPOUND:      return "COMPOUND";
+    default:                 return "?";
+    }
 }
 
 void unpack_statx(const ::fuse_statx& w, SetStatxIn& dst) noexcept {
@@ -708,6 +761,16 @@ void Session::Impl::handle_compound(
     std::byte*       out_p   = r.out + sizeof(::fuse_compound_out);
     std::byte* const out_end = r.out + r.cap;
 
+    // Per-subop produced nodeids, indexed by subop position. Threaded
+    // into dependent subops' fuse_in_header.nodeid before dispatch -
+    // mirrors fuse_compound_propagate_nodeid() in the kernel's legacy
+    // fallback path, which doesn't run when the daemon (us) handles
+    // compounds itself.
+    std::vector<std::uint64_t> produced;
+
+    const bool log = debug_enabled();
+    if (log) std::fputs("[fex] compound [", stderr);
+
     while (p < end) {
         const std::size_t hdrs = sizeof(::fuse_compound_req_in) +
                                  sizeof(::fuse_in_header);
@@ -715,7 +778,8 @@ void Session::Impl::handle_compound(
             out_p + sizeof(::fuse_out_header) > out_end) {
             reply_error(r, Errc::invalid_argument); return;
         }
-        // dep_index isn't wired through to the handlers yet; skip it.
+        ::fuse_compound_req_in sub_req;
+        std::memcpy(&sub_req, p, sizeof(sub_req));
         p += sizeof(::fuse_compound_req_in);
         ::fuse_in_header sub_h;
         std::memcpy(&sub_h, p, sizeof(sub_h));
@@ -728,6 +792,17 @@ void Session::Impl::handle_compound(
         }
         const std::size_t sub_len = sub_h.len - sizeof(::fuse_in_header);
 
+        if (sub_req.dep_index != FUSE_COMPOUND_NO_DEP &&
+            sub_req.dep_index < produced.size())
+            sub_h.nodeid = produced[sub_req.dep_index];
+
+        if (log) {
+            if (!produced.empty()) std::fputc(',', stderr);
+            std::fputs(opcode_name(sub_h.opcode), stderr);
+            if (sub_req.dep_index != FUSE_COMPOUND_NO_DEP)
+                std::fprintf(stderr, "^%u", sub_req.dep_index);
+        }
+
         Replier sub_r{ .out    = out_p + sizeof(::fuse_out_header),
                        .cap    = static_cast<std::size_t>(out_end - out_p) -
                                  sizeof(::fuse_out_header),
@@ -738,6 +813,21 @@ void Session::Impl::handle_compound(
             dispatch(sub_h, p, sub_len, sub_r);
         p += sub_len;
 
+        // Entry-producing opcodes return fuse_entry{x,}_out, both of
+        // which have the nodeid as their first u64. Anything else
+        // contributes 0 to the produced[] slot.
+        std::uint64_t prod = 0;
+        if (!sub_r.neg_err && sub_r.len >= sizeof(prod)) {
+            switch (sub_h.opcode) {
+            case FUSE_LOOKUPX:
+            case FUSE_MKOBJX:
+            case FUSE_LOOKUP_ROOT:
+                std::memcpy(&prod, sub_r.out, sizeof(prod));
+                break;
+            }
+        }
+        produced.push_back(prod);
+
         ::fuse_out_header oh{ .len    = static_cast<std::uint32_t>(
                                   sizeof(::fuse_out_header) +
                                   (sub_r.neg_err ? 0u : sub_r.len)),
@@ -746,6 +836,8 @@ void Session::Impl::handle_compound(
         std::memcpy(out_p, &oh, sizeof(oh));
         out_p += oh.len;
     }
+
+    if (log) std::fputs("]\n", stderr);
 
     r.neg_err = 0;
     r.len     = static_cast<std::size_t>(out_p - r.out);
