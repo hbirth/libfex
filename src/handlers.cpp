@@ -276,7 +276,8 @@ void Session::Impl::handle_setstatx(
     s.mask = sx->mask;
     unpack_statx(*sx, s);
 
-    auto rv = fs->setstatx(make_ctx(h), static_cast<NodeId>(h.nodeid), s);
+    auto rv = fs->setstatx(make_ctx(h), static_cast<NodeId>(h.nodeid),
+                           static_cast<FileHandle>(in->fh), s);
     if (!rv) { reply_error(r, rv.error()); return; }
 
     ::fuse_statx_out out;
@@ -421,6 +422,35 @@ void Session::Impl::handle_link(
     reply_ok(r);
 }
 
+void Session::Impl::handle_open(
+    const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
+    Replier& r)
+{
+    const auto* in = in_arg<::fuse_open_in>(h, body, body_len);
+    if (!in) { reply_error(r, Errc::invalid_argument); return; }
+
+    auto rv = fs->open(make_ctx(h), static_cast<NodeId>(h.nodeid), in->flags);
+    if (!rv) { reply_error(r, rv.error()); return; }
+
+    ::fuse_open_out out{};
+    out.fh         = to_underlying(rv->fh);
+    out.open_flags = rv->open_flags;
+    reply_pod(r, out);
+}
+
+void Session::Impl::handle_release(
+    const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
+    Replier& r)
+{
+    const auto* in = in_arg<::fuse_release_in>(h, body, body_len);
+    if (!in) { reply_error(r, Errc::invalid_argument); return; }
+
+    auto rv = fs->release(make_ctx(h), static_cast<NodeId>(h.nodeid),
+                          static_cast<FileHandle>(in->fh), in->flags);
+    if (!rv) { reply_error(r, rv.error()); return; }
+    reply_ok(r);
+}
+
 void Session::Impl::handle_read(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
@@ -434,6 +464,7 @@ void Session::Impl::handle_read(
     // max_pages negotiation in INIT) fits without a second copy.
     const std::size_t want = std::min<std::size_t>(in->size, r.cap);
     auto rv = fs->read(make_ctx(h), static_cast<NodeId>(h.nodeid),
+                       static_cast<FileHandle>(in->fh),
                        in->offset,
                        std::span<std::byte>{r.out, want});
     if (!rv) { reply_error(r, rv.error()); return; }
@@ -457,6 +488,7 @@ void Session::Impl::handle_write(
     }
     const std::byte* data = body + data_off;
     auto rv = fs->write(make_ctx(h), static_cast<NodeId>(h.nodeid),
+                        static_cast<FileHandle>(in->fh),
                         in->offset,
                         std::span<const std::byte>{data, in->size});
     if (!rv) { reply_error(r, rv.error()); return; }
@@ -501,6 +533,7 @@ void Session::Impl::handle_fallocate(
     if (!in) { reply_error(r, Errc::invalid_argument); return; }
 
     auto rv = fs->fallocate(make_ctx(h), static_cast<NodeId>(h.nodeid),
+                            static_cast<FileHandle>(in->fh),
                             in->mode, in->offset, in->length);
     if (!rv) { reply_error(r, rv.error()); return; }
     reply_ok(r);
@@ -748,6 +781,8 @@ void Session::Impl::dispatch(const ::fuse_in_header& h,
     case FUSE_READLINK:    handle_readlink   (h, body, body_len, r); break;
     case FUSE_STATFS:      handle_statfs     (h, body, body_len, r); break;
     case FUSE_FALLOCATE:   handle_fallocate  (h, body, body_len, r); break;
+    case FUSE_OPEN:        handle_open       (h, body, body_len, r); break;
+    case FUSE_RELEASE:     handle_release    (h, body, body_len, r); break;
     case FUSE_OPENDIR:     handle_opendir    (h, body, body_len, r); break;
     case FUSE_RELEASEDIR:  handle_releasedir (h, body, body_len, r); break;
     case FUSE_READDIR:     handle_readdir    (h, body, body_len, r); break;

@@ -20,11 +20,11 @@
 //   return std::unexpected{std::errc::…}.
 //
 // - The default implementations all return std::errc::function_not_supported
-//   so daemons override only what they need. The reverse-mapping
-//   FUSE_*_NO_OPEN flags aren't honored by the fusex kernel (no
-//   FUSE_OPEN exists in this protocol; reads/writes are nodeid-only),
-//   so there are no open()/release()/flush() callbacks for regular
-//   files - only for directories.
+//   so daemons override only what they need. Regular files get
+//   open()/release() callbacks (mirroring the classic FUSE protocol);
+//   reads/writes/fallocate carry the FileHandle the daemon returned
+//   at open time. Writes from writeback have no file context and
+//   arrive with fh=FileHandle{0}.
 
 #pragma once
 
@@ -99,10 +99,13 @@ public:
     statx(const Context& ctx, NodeId nodeid) = 0;
 
     // FUSE_SETSTATX (opcode 58): apply the masked attributes and reply
-    // with the new full StatxOut (post-mutation).
+    // with the new full StatxOut (post-mutation). `fh` is the open
+    // file's handle if the change came in through an open fd (e.g.
+    // ftruncate, fchmod); FileHandle{0} otherwise.
     virtual std::expected<StatxOut, Errc>
-    setstatx(const Context& ctx, NodeId nodeid, const SetStatxIn& in) {
-        (void)ctx; (void)nodeid; (void)in;
+    setstatx(const Context& ctx, NodeId nodeid, FileHandle fh,
+             const SetStatxIn& in) {
+        (void)ctx; (void)nodeid; (void)fh; (void)in;
         return std::unexpected{Errc::function_not_supported};
     }
 
@@ -160,32 +163,55 @@ public:
         return std::unexpected{Errc::function_not_supported};
     }
 
+    // FUSE_OPEN (opcode 14) / FUSE_RELEASE (opcode 18). open() runs
+    // once per open(2) on a regular file and returns an opaque
+    // FileHandle the kernel threads back on read/write/fallocate/
+    // ftruncate-style setstatx and on release() at close-time. fh=0
+    // is a legal return for daemons that don't need per-fd state.
+    virtual std::expected<OpenOut, Errc>
+    open(const Context& ctx, NodeId nodeid, std::uint32_t flags) {
+        (void)ctx; (void)nodeid; (void)flags;
+        return OpenOut{};  // fh=0, open_flags=0
+    }
+
+    virtual std::expected<void, Errc>
+    release(const Context& ctx, NodeId nodeid, FileHandle fh,
+            std::uint32_t flags) {
+        (void)ctx; (void)nodeid; (void)fh; (void)flags;
+        return {};
+    }
+
     // FUSE_READ (opcode 15). Fill `out` with up to `out.size()` bytes
     // starting at `offset`. Return the number actually written. The
     // dispatcher zero-fills the tail if the daemon returns short.
+    // `fh` is what open() returned, or 0 for kernel-internal reads
+    // (e.g. readahead with no file context).
     virtual std::expected<std::size_t, Errc>
-    read(const Context& ctx, NodeId nodeid,
+    read(const Context& ctx, NodeId nodeid, FileHandle fh,
          std::uint64_t offset, std::span<std::byte> out) {
-        (void)ctx; (void)nodeid; (void)offset; (void)out;
+        (void)ctx; (void)nodeid; (void)fh; (void)offset; (void)out;
         return std::unexpected{Errc::function_not_supported};
     }
 
     // FUSE_WRITE (opcode 16). Consume `in` starting at `offset`.
     // Return the number of bytes accepted; the kernel verifies that
-    // it equals `in.size()` and -EIOs the request otherwise.
+    // it equals `in.size()` and -EIOs the request otherwise. `fh` is
+    // 0 for writes coming out of writeback (the writer may have
+    // closed before the page reaches the daemon).
     virtual std::expected<std::size_t, Errc>
-    write(const Context& ctx, NodeId nodeid,
+    write(const Context& ctx, NodeId nodeid, FileHandle fh,
           std::uint64_t offset, std::span<const std::byte> in) {
-        (void)ctx; (void)nodeid; (void)offset; (void)in;
+        (void)ctx; (void)nodeid; (void)fh; (void)offset; (void)in;
         return std::unexpected{Errc::function_not_supported};
     }
 
     // FUSE_FALLOCATE (opcode 43). The fusex kernel filters modes to
     // KEEP_SIZE|PUNCH_HOLE|ZERO_RANGE before forwarding.
     virtual std::expected<void, Errc>
-    fallocate(const Context& ctx, NodeId nodeid,
+    fallocate(const Context& ctx, NodeId nodeid, FileHandle fh,
               std::uint32_t mode, std::uint64_t offset, std::uint64_t length) {
-        (void)ctx; (void)nodeid; (void)mode; (void)offset; (void)length;
+        (void)ctx; (void)nodeid; (void)fh;
+        (void)mode; (void)offset; (void)length;
         return std::unexpected{Errc::function_not_supported};
     }
 

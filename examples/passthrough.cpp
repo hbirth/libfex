@@ -317,32 +317,42 @@ public:
     }
 
     std::expected<fex::StatxOut, fex::Errc>
-    setstatx(const fex::Context&, fex::NodeId n,
+    setstatx(const fex::Context&, fex::NodeId n, fex::FileHandle fh,
              const fex::SetStatxIn& in) override
     {
-        trace("[fex] setstatx node=%llu mask=0x%x mode=0%o size=%llu\n",
-              u64(n), (unsigned)in.mask, (unsigned)in.mode,
+        trace("[fex] setstatx node=%llu fh=%llu mask=0x%x mode=0%o size=%llu\n",
+              u64(n), u64(fh), (unsigned)in.mask, (unsigned)in.mode,
               (unsigned long long)in.size);
-        auto inode = table_.get(n);
-        if (!inode) return stale();
-        const int fd = inode->path_fd.get();
 
-        // For O_PATH fds we can't do most fchmod/utimens directly;
-        // route through /proc/self/fd/N where needed.
+        // Prefer the open fd (ftruncate/fchmod/futimens directly). Fall
+        // back to /proc/self/fd<N> for path-based calls when the caller
+        // didn't open the file (chmod/chown/utimensat from a path, or
+        // truncate(2) without an fd).
+        int fd = file_fd(fh);
         char proc[64];
-        std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
+        if (fd < 0) {
+            auto inode = table_.get(n);
+            if (!inode) return stale();
+            std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d",
+                          inode->path_fd.get());
+        }
 
         if (in.mask & fex::statx_mask::mode) {
-            if (::chmod(proc, in.mode) < 0) return wrap_errno();
+            int r = (fd >= 0) ? ::fchmod(fd, in.mode)
+                              : ::chmod(proc, in.mode);
+            if (r < 0) return wrap_errno();
         }
         if (in.mask & (fex::statx_mask::uid | fex::statx_mask::gid)) {
             uid_t u = (in.mask & fex::statx_mask::uid) ? in.uid : (uid_t)-1;
             gid_t g = (in.mask & fex::statx_mask::gid) ? in.gid : (gid_t)-1;
-            if (::lchown(proc, u, g) < 0) return wrap_errno();
+            int r = (fd >= 0) ? ::fchown(fd, u, g)
+                              : ::lchown(proc, u, g);
+            if (r < 0) return wrap_errno();
         }
         if (in.mask & fex::statx_mask::size) {
-            // truncate via /proc fd path (works for O_PATH).
-            if (::truncate(proc, (off_t)in.size) < 0) return wrap_errno();
+            int r = (fd >= 0) ? ::ftruncate(fd, (off_t)in.size)
+                              : ::truncate(proc, (off_t)in.size);
+            if (r < 0) return wrap_errno();
         }
         if (in.mask & (fex::statx_mask::atime | fex::statx_mask::mtime)) {
             struct timespec ts[2];
@@ -352,7 +362,9 @@ public:
             ts[1] = (in.mask & fex::statx_mask::mtime)
                     ? timespec{in.mtime.sec, (long)in.mtime.nsec}
                     : timespec{0, UTIME_OMIT};
-            if (::utimensat(AT_FDCWD, proc, ts, 0) < 0) return wrap_errno();
+            int r = (fd >= 0) ? ::futimens(fd, ts)
+                              : ::utimensat(AT_FDCWD, proc, ts, 0);
+            if (r < 0) return wrap_errno();
         }
 
         return statx(fex::Context{}, n);
@@ -516,39 +528,27 @@ public:
     }
 
     std::expected<std::size_t, fex::Errc>
-    read(const fex::Context&, fex::NodeId n, std::uint64_t off,
-         std::span<std::byte> out) override
+    read(const fex::Context&, fex::NodeId n, fex::FileHandle fh,
+         std::uint64_t off, std::span<std::byte> out) override
     {
-        trace("[fex] read node=%llu off=%llu size=%zu\n",
-              u64(n), (unsigned long long)off, out.size());
-        auto in = table_.get(n);
-        if (!in) return stale();
-        // O_PATH fd can't be read from; re-open with O_RDONLY each
-        // time. A real daemon would cache handles.
-        char proc[64];
-        std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", in->path_fd.get());
-        int fd = ::open(proc, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) return wrap_errno();
-        ssize_t r = ::pread(fd, out.data(), out.size(), (off_t)off);
-        ::close(fd);
+        trace("[fex] read node=%llu fh=%llu off=%llu size=%zu\n",
+              u64(n), u64(fh), (unsigned long long)off, out.size());
+        auto io = io_fd(n, fh, O_RDONLY);
+        if (!io) return std::unexpected{io.error()};
+        ssize_t r = ::pread(io->fd, out.data(), out.size(), (off_t)off);
         if (r < 0) return wrap_errno();
         return static_cast<std::size_t>(r);
     }
 
     std::expected<std::size_t, fex::Errc>
-    write(const fex::Context&, fex::NodeId n, std::uint64_t off,
-          std::span<const std::byte> in) override
+    write(const fex::Context&, fex::NodeId n, fex::FileHandle fh,
+          std::uint64_t off, std::span<const std::byte> in) override
     {
-        trace("[fex] write node=%llu off=%llu size=%zu\n",
-              u64(n), (unsigned long long)off, in.size());
-        auto inode = table_.get(n);
-        if (!inode) return stale();
-        char proc[64];
-        std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", inode->path_fd.get());
-        int fd = ::open(proc, O_WRONLY | O_CLOEXEC);
-        if (fd < 0) return wrap_errno();
-        ssize_t r = ::pwrite(fd, in.data(), in.size(), (off_t)off);
-        ::close(fd);
+        trace("[fex] write node=%llu fh=%llu off=%llu size=%zu\n",
+              u64(n), u64(fh), (unsigned long long)off, in.size());
+        auto io = io_fd(n, fh, O_WRONLY);
+        if (!io) return std::unexpected{io.error()};
+        ssize_t r = ::pwrite(io->fd, in.data(), in.size(), (off_t)off);
         if (r < 0) return wrap_errno();
         return static_cast<std::size_t>(r);
     }
@@ -573,21 +573,56 @@ public:
     }
 
     std::expected<void, fex::Errc>
-    fallocate(const fex::Context&, fex::NodeId n, std::uint32_t mode,
+    fallocate(const fex::Context&, fex::NodeId n, fex::FileHandle fh,
+              std::uint32_t mode,
               std::uint64_t off, std::uint64_t len) override
     {
-        trace("[fex] fallocate node=%llu mode=0x%x off=%llu len=%llu\n",
-              u64(n), (unsigned)mode,
+        trace("[fex] fallocate node=%llu fh=%llu mode=0x%x off=%llu len=%llu\n",
+              u64(n), u64(fh), (unsigned)mode,
               (unsigned long long)off, (unsigned long long)len);
-        auto in = table_.get(n);
-        if (!in) return stale();
-        char proc[64];
-        std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d", in->path_fd.get());
-        int fd = ::open(proc, O_WRONLY | O_CLOEXEC);
-        if (fd < 0) return wrap_errno();
-        int r = ::fallocate(fd, mode, (off_t)off, (off_t)len);
-        ::close(fd);
+        auto io = io_fd(n, fh, O_WRONLY);
+        if (!io) return std::unexpected{io.error()};
+        int r = ::fallocate(io->fd, mode, (off_t)off, (off_t)len);
         if (r < 0) return wrap_errno();
+        return {};
+    }
+
+    // File handle table -----------------------------------------------
+    //
+    // The backing path_fd we cache per inode is O_PATH, which can't do
+    // I/O. open() upgrades it via /proc/self/fd/<N> to a real fd at the
+    // requested access mode and stashes it under a new FileHandle.
+    // read/write/fallocate find it via file_fd(fh).
+
+    std::expected<fex::OpenOut, fex::Errc>
+    open(const fex::Context&, fex::NodeId n, std::uint32_t flags) override {
+        trace("[fex] open node=%llu flags=0x%x\n", u64(n), (unsigned)flags);
+        auto inode = table_.get(n);
+        if (!inode) return stale();
+        char proc[64];
+        std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d",
+                      inode->path_fd.get());
+        // Mask to persistent open(2) flags; O_CREAT / O_TRUNC / O_EXCL
+        // have already been consumed by the VFS by the time the
+        // kernel forwards us here. O_CLOEXEC is ours.
+        constexpr int kPersistent = O_ACCMODE | O_APPEND | O_NONBLOCK |
+                                    O_DIRECT | O_NOATIME;
+        int fd = ::open(proc, ((int)flags & kPersistent) | O_CLOEXEC);
+        if (fd < 0) return wrap_errno();
+
+        std::lock_guard lk(files_mu_);
+        auto handle = static_cast<fex::FileHandle>(++file_id_);
+        files_.emplace(fex::to_underlying(handle), Fd{fd});
+        return fex::OpenOut{.fh = handle, .open_flags = 0};
+    }
+
+    std::expected<void, fex::Errc>
+    release(const fex::Context&, fex::NodeId n, fex::FileHandle fh,
+            std::uint32_t flags) override {
+        trace("[fex] release node=%llu fh=%llu flags=0x%x\n",
+              u64(n), u64(fh), (unsigned)flags);
+        std::lock_guard lk(files_mu_);
+        files_.erase(fex::to_underlying(fh));
         return {};
     }
 
@@ -723,7 +758,42 @@ public:
     }
 
 private:
+    // Look up the cached fd for an open regular file. Returns -1 if
+    // `fh` is the zero sentinel (writeback writes etc.) or not in the
+    // table.
+    int file_fd(fex::FileHandle fh) const {
+        if (fex::to_underlying(fh) == 0) return -1;
+        std::shared_lock lk(files_mu_);
+        auto it = files_.find(fex::to_underlying(fh));
+        return it == files_.end() ? -1 : it->second.get();
+    }
+
+    // Resolve `fh` to an fd usable at `mode`. If `fh` is live the
+    // returned `owner` is empty and `fd` is borrowed from the files_
+    // table. If `fh` is the writeback-style zero sentinel, re-open the
+    // inode's O_PATH fd via /proc/self/fd; `owner` keeps that fd alive
+    // until the caller's scope ends.
+    struct IoFd { int fd; Fd owner; };
+    std::expected<IoFd, fex::Errc>
+    io_fd(fex::NodeId n, fex::FileHandle fh, int mode) const {
+        if (int fd = file_fd(fh); fd >= 0)
+            return IoFd{fd, Fd{}};
+        auto in = table_.get(n);
+        if (!in) return stale();
+        char proc[64];
+        std::snprintf(proc, sizeof(proc), "/proc/self/fd/%d",
+                      in->path_fd.get());
+        int t = ::open(proc, mode | O_CLOEXEC);
+        if (t < 0) return wrap_errno();
+        return IoFd{t, Fd{t}};
+    }
+
     InodeTable table_;
+
+    mutable std::shared_mutex files_mu_;
+    std::unordered_map<std::uint64_t, Fd> files_;
+    std::uint64_t file_id_ = 0;
+
     std::mutex dirs_mu_;
     std::unordered_map<std::uint64_t, DIR*> dirs_;
     std::uint64_t dir_id_ = 0;

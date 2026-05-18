@@ -158,6 +158,8 @@ struct Session::Impl {
     void handle_unlink     (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&, bool is_rmdir);
     void handle_rename2    (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_link       (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
+    void handle_open       (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
+    void handle_release    (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_read       (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_write      (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_readlink   (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
