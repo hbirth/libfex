@@ -3,16 +3,10 @@
 // Per-opcode handlers and the top-level dispatch switch.
 //
 // Each handler is a Session::Impl member taking the in-header, a pointer
-// to the bytes that follow it, the remaining length, and a Replier to
-// fill. No I/O happens here — handlers are pure CPU work that produces a
-// reply blob. The io_uring transport (uring_worker.cpp) ships those
-// blobs back to the kernel.
-//
-// Wire-layout note: under io_uring, the kernel splits a request's
-// in_args[] across `op_in` (a 128 B slot at the start of the body) and
-// the payload region. Handlers that read past the first in-arg reach
-// the variable-length part at body + kPayloadOffset, NOT at
-// body + sizeof(per_op_struct).
+// to the in_args bytes (laid out contiguously by the worker), the
+// remaining length, and a Replier to fill. No I/O happens here —
+// handlers are pure CPU work; the io_uring transport in uring_worker.cpp
+// ships the reply blobs back to the kernel.
 
 #include "session_impl.hpp"
 
@@ -128,18 +122,18 @@ void Session::Impl::handle_init(
     // the session has no other transport once bootstrap ends.
     info.flags |= FUSE_OVER_IO_URING;
 
-    if (info.kernel_major != FEX_KERNEL_VERSION) {
+    if (info.kernel_major != FUSE_KERNEL_VERSION) {
         // Major mismatch: per the FUSE handshake we reply with our
         // version and the kernel will either re-INIT or give up.
         ::fuse_init_out out{};
-        out.major = FEX_KERNEL_VERSION;
+        out.major = FUSE_KERNEL_VERSION;
         reply_pod(r, out);
         return;
     }
 
     ::fuse_init_out out{};
-    out.major          = FEX_KERNEL_VERSION;
-    out.minor          = std::min<std::uint32_t>(in->minor, FEX_KERNEL_MINOR_VERSION);
+    out.major          = FUSE_KERNEL_VERSION;
+    out.minor          = std::min<std::uint32_t>(in->minor, FUSE_KERNEL_MINOR_VERSION);
     out.max_readahead  = in->max_readahead;
     out.flags          = static_cast<std::uint32_t>(info.flags & 0xffffffffu);
     out.flags2         = static_cast<std::uint32_t>(info.flags >> 32);
@@ -173,17 +167,14 @@ void Session::Impl::handle_lookupx(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // in_args[0] = u64 zero (8 B, lives in op_in).
-    // in_args[1] = NUL-terminated name (lives in payload).
-    // Under io_uring transport the name therefore starts at
-    // body[kPayloadOffset], not at body[sizeof(u64)].
-    if (body_len < kPayloadOffset + 1u) {
+    // Only in_arg: NUL-terminated name (kernel uses ADD_IN_ARG_ZERO for
+    // an empty leading arg, so the name starts at the head of body).
+    if (body_len < 1u) {
         reply_error(r, Errc::invalid_argument); return;
     }
-    const char* name = reinterpret_cast<const char*>(body + kPayloadOffset);
-    const std::size_t avail = body_len - kPayloadOffset;
-    const std::size_t nlen  = ::strnlen(name, avail);
-    if (nlen == avail) { reply_error(r, Errc::invalid_argument); return; }
+    const char* name = reinterpret_cast<const char*>(body);
+    const std::size_t nlen = ::strnlen(name, body_len);
+    if (nlen == body_len) { reply_error(r, Errc::invalid_argument); return; }
 
     auto rv = fs->lookupx(make_ctx(h), static_cast<NodeId>(h.nodeid),
                           std::string_view{name, nlen});
@@ -224,15 +215,15 @@ void Session::Impl::handle_batch_forget(
     if (!in) { reply_error(r, Errc::invalid_argument); return; }
 
     const std::uint32_t count = in->count;
+    constexpr std::size_t off  = sizeof(::fuse_batch_forget_in);
     const std::size_t need = static_cast<std::size_t>(count) *
                              sizeof(::fuse_forget_one);
-    if (body_len < kPayloadOffset + need) {
+    if (body_len < off + need) {
         // Truncated batch. There is no error reply for BATCH_FORGET on
         // the wire either; just bail without calling the FS.
         reply_ok(r); return;
     }
-    const auto* items = reinterpret_cast<const ::fuse_forget_one*>(
-        body + kPayloadOffset);
+    const auto* items = reinterpret_cast<const ::fuse_forget_one*>(body + off);
 
     // Repack into the public (NodeId, nlookup) shape so daemons don't
     // see wire types. The vector is bounded by `count`; for typical
@@ -269,21 +260,17 @@ void Session::Impl::handle_setstatx(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // Wire layout under io_uring (kernel splits fuse_setstatx_in
-    // around offsetof(.., stat) so the small header fits in op_in):
-    //   body[0..15]                 = fuse_setstatx_in control header
-    //                                 (fh, flags, reserved) — read via in_arg<>
-    //   body[kPayloadOffset..+255]  = struct fuse_statx
-    // The C struct in <linux/fuse.h>/abi.h still embeds .stat, but on
-    // the wire it travels as a separate in_arg, so we must read it
-    // from the payload region rather than from in->stat.
+    // The kernel splits fuse_setstatx_in around offsetof(stat):
+    //   in_args[0] = control header (fh, flags, reserved) — 16 B
+    //   in_args[1] = struct fuse_statx
+    // The C struct still embeds .stat but on the wire .stat is a
+    // separate in_arg, so we read it past the control header.
+    constexpr std::size_t stat_off = offsetof(::fuse_setstatx_in, stat);
     const auto* in = in_arg<::fuse_setstatx_in>(h, body, body_len);
-    if (!in) { reply_error(r, Errc::invalid_argument); return; }
-    if (body_len < kPayloadOffset + sizeof(::fuse_statx)) {
+    if (!in || body_len < stat_off + sizeof(::fuse_statx)) {
         reply_error(r, Errc::invalid_argument); return;
     }
-    const auto* sx = reinterpret_cast<const ::fuse_statx*>(
-        body + kPayloadOffset);
+    const auto* sx = reinterpret_cast<const ::fuse_statx*>(body + stat_off);
 
     SetStatxIn s;
     s.mask = sx->mask;
@@ -301,28 +288,18 @@ void Session::Impl::handle_mkobjx(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // Wire layout under io_uring:
-    //   body[0..offsetof(stat)-1]   = fuse_mkobjx_in control header
-    //                                 (namesize, flags, spare) — read via in
-    //   body[kPayloadOffset..+255]  = struct fuse_statx (in_args[1])
-    //   body[kPayloadOffset+256..]  = name + NUL (in_args[2])
-    //   body[..]                    = link_body (in_args[3], S_IFLNK only)
-    // The C struct in abi.h still has .stat as a member but it now sits
-    // after the control fields; reading in->stat would point at the
-    // unused op_in padding, so we always fetch the statx from payload.
-    constexpr std::size_t hdr_sz = offsetof(::fuse_mkobjx_in, stat);
+    // Wire: [namesize/flags/spare][struct fuse_statx][name+NUL][link_body?]
+    // (link_body present only for S_IFLNK).
+    constexpr std::size_t hdr_sz   = offsetof(::fuse_mkobjx_in, stat);
+    constexpr std::size_t stat_off = hdr_sz;
+    constexpr std::size_t name_off = stat_off + sizeof(::fuse_statx);
     const std::size_t ext = std::size_t{h.total_extlen} * 8u;
-    if (body_len < ext + hdr_sz) {
+    if (body_len < ext + name_off) {
         reply_error(r, Errc::invalid_argument); return;
     }
     const auto* in = reinterpret_cast<const ::fuse_mkobjx_in*>(body + ext);
-    if (body_len < kPayloadOffset + sizeof(::fuse_statx)) {
-        reply_error(r, Errc::invalid_argument); return;
-    }
-    const auto* sx = reinterpret_cast<const ::fuse_statx*>(
-        body + kPayloadOffset);
+    const auto* sx = reinterpret_cast<const ::fuse_statx*>(body + stat_off);
 
-    const std::size_t name_off = kPayloadOffset + sizeof(::fuse_statx);
     if (body_len < name_off + in->namesize) {
         reply_error(r, Errc::invalid_argument); return;
     }
@@ -374,16 +351,13 @@ void Session::Impl::handle_unlink(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r, bool is_rmdir)
 {
-    // in_args[0] = u64 zero pad (op_in). in_args[1] = name (payload).
-    if (body_len < kPayloadOffset + 1u) {
-        reply_error(r, Errc::invalid_argument); return;
-    }
-    const char* name = reinterpret_cast<const char*>(body + kPayloadOffset);
-    const std::size_t avail = body_len - kPayloadOffset;
-    const std::size_t nlen  = ::strnlen(name, avail);
-    if (nlen == avail) { reply_error(r, Errc::invalid_argument); return; }
+    // Kernel sends an empty in_args[0] and the name as in_args[1].
+    if (body_len < 1u) { reply_error(r, Errc::invalid_argument); return; }
+    const char* name = reinterpret_cast<const char*>(body);
+    const std::size_t nlen = ::strnlen(name, body_len);
+    if (nlen == body_len) { reply_error(r, Errc::invalid_argument); return; }
 
-    auto sv = std::string_view{name, nlen};
+    const auto sv = std::string_view{name, nlen};
     auto rv = is_rmdir
         ? fs->rmdir(make_ctx(h), static_cast<NodeId>(h.nodeid), sv)
         : fs->unlink(make_ctx(h), static_cast<NodeId>(h.nodeid), sv);
@@ -395,16 +369,15 @@ void Session::Impl::handle_rename2(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // in_args[0] = fuse_rename2_in (op_in).
-    // in_args[1] = old_name + NUL + new_name + NUL (payload).
-    const std::size_t ext = std::size_t{h.total_extlen} * 8u;
-    if (body_len < ext + sizeof(::fuse_rename2_in) ||
-        body_len < kPayloadOffset + 2u) {
+    // Wire: [fuse_rename2_in][old_name + NUL + new_name + NUL]
+    const std::size_t ext   = std::size_t{h.total_extlen} * 8u;
+    const std::size_t names_off = ext + sizeof(::fuse_rename2_in);
+    if (body_len < names_off + 2u) {
         reply_error(r, Errc::invalid_argument); return;
     }
     const auto* in = reinterpret_cast<const ::fuse_rename2_in*>(body + ext);
-    const char* names = reinterpret_cast<const char*>(body + kPayloadOffset);
-    const std::size_t avail = body_len - kPayloadOffset;
+    const char* names = reinterpret_cast<const char*>(body + names_off);
+    const std::size_t avail = body_len - names_off;
 
     const std::size_t olen = ::strnlen(names, avail);
     if (olen == avail) { reply_error(r, Errc::invalid_argument); return; }
@@ -426,15 +399,15 @@ void Session::Impl::handle_link(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // in_args[0] = fuse_link_in (op_in).  in_args[1] = name (payload).
-    const std::size_t ext = std::size_t{h.total_extlen} * 8u;
-    if (body_len < ext + sizeof(::fuse_link_in) ||
-        body_len < kPayloadOffset + 1u) {
+    // Wire: [fuse_link_in][name + NUL]
+    const std::size_t ext      = std::size_t{h.total_extlen} * 8u;
+    const std::size_t name_off = ext + sizeof(::fuse_link_in);
+    if (body_len < name_off + 1u) {
         reply_error(r, Errc::invalid_argument); return;
     }
     const auto* in = reinterpret_cast<const ::fuse_link_in*>(body + ext);
-    const char* name = reinterpret_cast<const char*>(body + kPayloadOffset);
-    const std::size_t avail = body_len - kPayloadOffset;
+    const char* name = reinterpret_cast<const char*>(body + name_off);
+    const std::size_t avail = body_len - name_off;
     const std::size_t nlen = ::strnlen(name, avail);
     if (nlen == avail) { reply_error(r, Errc::invalid_argument); return; }
 
@@ -472,18 +445,17 @@ void Session::Impl::handle_write(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // in_args[0] = fuse_write_in (op_in).  in_args[1] = data (payload).
-    const std::size_t ext = std::size_t{h.total_extlen} * 8u;
-    if (body_len < ext + sizeof(::fuse_write_in) ||
-        body_len < kPayloadOffset) {
+    // Wire: [fuse_write_in][data]
+    const std::size_t ext      = std::size_t{h.total_extlen} * 8u;
+    const std::size_t data_off = ext + sizeof(::fuse_write_in);
+    if (body_len < data_off) {
         reply_error(r, Errc::invalid_argument); return;
     }
     const auto* in = reinterpret_cast<const ::fuse_write_in*>(body + ext);
-    const std::byte* data = body + kPayloadOffset;
-    const std::size_t avail = body_len - kPayloadOffset;
-    if (avail < in->size) {
+    if (body_len - data_off < in->size) {
         reply_error(r, Errc::invalid_argument); return;
     }
+    const std::byte* data = body + data_off;
     auto rv = fs->write(make_ctx(h), static_cast<NodeId>(h.nodeid),
                         in->offset,
                         std::span<const std::byte>{data, in->size});
@@ -585,15 +557,15 @@ void Session::Impl::handle_getxattr(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // in_args[0] = fuse_getxattr_in (op_in).  in_args[1] = name (payload).
-    const std::size_t ext = std::size_t{h.total_extlen} * 8u;
-    if (body_len < ext + sizeof(::fuse_getxattr_in) ||
-        body_len < kPayloadOffset + 1u) {
+    // Wire: [fuse_getxattr_in][name + NUL]
+    const std::size_t ext      = std::size_t{h.total_extlen} * 8u;
+    const std::size_t name_off = ext + sizeof(::fuse_getxattr_in);
+    if (body_len < name_off + 1u) {
         reply_error(r, Errc::invalid_argument); return;
     }
     const auto* in = reinterpret_cast<const ::fuse_getxattr_in*>(body + ext);
-    const char* name = reinterpret_cast<const char*>(body + kPayloadOffset);
-    const std::size_t avail = body_len - kPayloadOffset;
+    const char* name = reinterpret_cast<const char*>(body + name_off);
+    const std::size_t avail = body_len - name_off;
     const std::size_t nlen = ::strnlen(name, avail);
     if (nlen == avail) { reply_error(r, Errc::invalid_argument); return; }
 
@@ -621,20 +593,19 @@ void Session::Impl::handle_setxattr(
     const ::fuse_in_header& h, const std::byte* body, std::size_t body_len,
     Replier& r)
 {
-    // in_args[0] = fuse_setxattr_in (op_in).
-    // in_args[1] = name + NUL + value (payload).
-    const std::size_t ext = std::size_t{h.total_extlen} * 8u;
-    if (body_len < ext + sizeof(::fuse_setxattr_in) ||
-        body_len < kPayloadOffset + 1u) {
+    // Wire: [fuse_setxattr_in][name + NUL][value]
+    const std::size_t ext      = std::size_t{h.total_extlen} * 8u;
+    const std::size_t name_off = ext + sizeof(::fuse_setxattr_in);
+    if (body_len < name_off + 1u) {
         reply_error(r, Errc::invalid_argument); return;
     }
     const auto* in = reinterpret_cast<const ::fuse_setxattr_in*>(body + ext);
-    const char* name = reinterpret_cast<const char*>(body + kPayloadOffset);
-    const std::size_t avail = body_len - kPayloadOffset;
+    const char* name = reinterpret_cast<const char*>(body + name_off);
+    const std::size_t avail = body_len - name_off;
     const std::size_t nlen = ::strnlen(name, avail);
     if (nlen == avail) { reply_error(r, Errc::invalid_argument); return; }
 
-    const std::size_t after = kPayloadOffset + nlen + 1u;
+    const std::size_t after = name_off + nlen + 1u;
     if (body_len < after + in->size) {
         reply_error(r, Errc::invalid_argument); return;
     }
@@ -685,6 +656,68 @@ void Session::Impl::handle_removexattr(
     reply_ok(r);
 }
 
+void Session::Impl::handle_compound(
+    const ::fuse_in_header&, const std::byte* body, std::size_t body_len,
+    Replier& r)
+{
+    // Wire: [fuse_compound_in] {[fuse_compound_req_in][fuse_in_header]
+    // [in_args...]}*. The reply mirrors it: [fuse_compound_out]
+    // {[fuse_out_header][out_args...]}*. The top-level fuse_out_header
+    // is written by the worker around what we put in r.out.
+    if (body_len < sizeof(::fuse_compound_in) ||
+        r.cap   < sizeof(::fuse_compound_out)) {
+        reply_error(r, Errc::invalid_argument); return;
+    }
+    std::memset(r.out, 0, sizeof(::fuse_compound_out));
+
+    const std::byte* p       = body + sizeof(::fuse_compound_in);
+    const std::byte* end     = body + body_len;
+    std::byte*       out_p   = r.out + sizeof(::fuse_compound_out);
+    std::byte* const out_end = r.out + r.cap;
+
+    while (p < end) {
+        const std::size_t hdrs = sizeof(::fuse_compound_req_in) +
+                                 sizeof(::fuse_in_header);
+        if (static_cast<std::size_t>(end - p) < hdrs ||
+            out_p + sizeof(::fuse_out_header) > out_end) {
+            reply_error(r, Errc::invalid_argument); return;
+        }
+        // dep_index isn't wired through to the handlers yet; skip it.
+        p += sizeof(::fuse_compound_req_in);
+        ::fuse_in_header sub_h;
+        std::memcpy(&sub_h, p, sizeof(sub_h));
+        p += sizeof(::fuse_in_header);
+
+        if (sub_h.len < sizeof(::fuse_in_header) ||
+            static_cast<std::size_t>(end - p) <
+                sub_h.len - sizeof(::fuse_in_header)) {
+            reply_error(r, Errc::invalid_argument); return;
+        }
+        const std::size_t sub_len = sub_h.len - sizeof(::fuse_in_header);
+
+        Replier sub_r{ .out    = out_p + sizeof(::fuse_out_header),
+                       .cap    = static_cast<std::size_t>(out_end - out_p) -
+                                 sizeof(::fuse_out_header),
+                       .unique = sub_h.unique };
+        if (sub_h.opcode == FUSE_COMPOUND)
+            reply_error(sub_r, Errc::operation_not_supported);
+        else
+            dispatch(sub_h, p, sub_len, sub_r);
+        p += sub_len;
+
+        ::fuse_out_header oh{ .len    = static_cast<std::uint32_t>(
+                                  sizeof(::fuse_out_header) +
+                                  (sub_r.neg_err ? 0u : sub_r.len)),
+                              .error  = sub_r.neg_err,
+                              .unique = sub_h.unique };
+        std::memcpy(out_p, &oh, sizeof(oh));
+        out_p += oh.len;
+    }
+
+    r.neg_err = 0;
+    r.len     = static_cast<std::size_t>(out_p - r.out);
+}
+
 // -----------------------------------------------------------------------
 // Top-level dispatch
 // -----------------------------------------------------------------------
@@ -722,6 +755,7 @@ void Session::Impl::dispatch(const ::fuse_in_header& h,
     case FUSE_SETXATTR:    handle_setxattr   (h, body, body_len, r); break;
     case FUSE_LISTXATTR:   handle_listxattr  (h, body, body_len, r); break;
     case FUSE_REMOVEXATTR: handle_removexattr(h, body, body_len, r); break;
+    case FUSE_COMPOUND:    handle_compound   (h, body, body_len, r); break;
     default:
         reply_error(r, Errc::function_not_supported);
         break;

@@ -144,18 +144,6 @@ struct Session::Impl {
         return reinterpret_cast<const InArg*>(body + ext_bytes);
     }
 
-    // io_uring transport packing: the kernel puts args->in_args[0] into
-    // the 128 B `op_in` slot of fuse_uring_req_header and args->in_args[1..]
-    // into the payload region. Our worker reassembles them as
-    //   body = [op_in (128 B)] [payload (variable)]
-    // so the per-op header sits at body[0..sizeof(struct)] (which is what
-    // in_arg<T> already returns) and any variable-length data that
-    // follows starts at body[FUSE_URING_OP_IN_OUT_SZ], NOT at
-    // body[sizeof(struct)] as it would in a legacy /dev/fuse concat
-    // layout. Every handler that reaches past the per-op header uses
-    // kPayloadOffset for that jump.
-    static constexpr std::size_t kPayloadOffset = FUSE_URING_OP_IN_OUT_SZ;
-
     // Per-opcode handlers (defined in handlers.cpp). Each takes the
     // in-header, a pointer to the first byte after the header, the
     // remaining body length, and the Replier it fills with its reply.
@@ -182,6 +170,7 @@ struct Session::Impl {
     void handle_setxattr   (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_listxattr  (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
     void handle_removexattr(const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
+    void handle_compound   (const ::fuse_in_header&, const std::byte*, std::size_t, Replier&);
 
     // Pure dispatch: pick the handler by h.opcode and call it. No I/O.
     void dispatch(const ::fuse_in_header& h,

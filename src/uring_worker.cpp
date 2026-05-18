@@ -143,44 +143,42 @@ std::uint32_t RingWorker::handle_one(std::uint32_t i) noexcept
     Entry& e = entries_[i];
     auto* req = reinterpret_cast<::fuse_uring_req_header*>(e.buf);
 
-    // The kernel laid out the request as:
-    //   in_out[0..40]               -> fuse_in_header
-    //   op_in[0..N]                  -> per-op header (e.g. fuse_read_in)
-    //   ring_ent_in_out.commit_id    -> id to use in COMMIT_AND_FETCH
-    //   ring_ent_in_out.payload_sz   -> bytes the kernel placed in payload
-    //   buf + sizeof(req_header)    -> payload area
+    // Kernel request layout:
+    //   in_out[0..40]              -> fuse_in_header
+    //   op_in[0..in_args[0].size]  -> first in_arg
+    //   ring_ent_in_out.payload_sz -> in_args[1..] in the payload area
     e.commit_id = req->ring_ent_in_out.commit_id;
     const std::uint32_t payload_sz = req->ring_ent_in_out.payload_sz;
 
     const auto* h = reinterpret_cast<const ::fuse_in_header*>(req->in_out);
+    ::fuse_in_header h_copy = *h;  // reply clobbers in_out
 
-    // Reassemble [op_in][payload] into the scratch body buffer so the
-    // existing handlers (which expect "body" as one contiguous span
-    // starting after fuse_in_header) work unchanged. op_in is at most
-    // FUSE_URING_OP_IN_OUT_SZ = 128 bytes; we always copy that fixed
-    // amount and follow with `payload_sz` bytes from the payload area.
-    constexpr std::size_t op_sz = FUSE_URING_OP_IN_OUT_SZ;
-    const std::size_t body_len  = op_sz + payload_sz;
-    if (body_len > e.body_scratch.size()) {
-        // Kernel sent more than we advertised; the daemon must have
-        // negotiated max_pages wrong. Reply -EIO.
+    // in_args[0].size is derivable from the request — it's whatever's
+    // left after the header and the payload. Assemble the body as one
+    // contiguous [in_args[0]][in_args[1..]] span; handlers then index
+    // past in_args[0] using sizeof(its first in_arg struct).
+    const std::size_t first_arg_sz =
+        h_copy.len >= sizeof(::fuse_in_header) + payload_sz
+            ? h_copy.len - sizeof(::fuse_in_header) - payload_sz
+            : 0u;
+    const std::size_t body_len = first_arg_sz + payload_sz;
+
+    if (first_arg_sz > FUSE_URING_OP_IN_OUT_SZ ||
+        body_len > e.body_scratch.size()) {
         auto* outh = reinterpret_cast<::fuse_out_header*>(req->in_out);
-        outh->unique = h->unique;
+        outh->unique = h_copy.unique;
         outh->error  = -EIO;
         outh->len    = sizeof(::fuse_out_header);
         req->ring_ent_in_out.payload_sz = 0;
         return 0;
     }
 
-    std::memcpy(e.body_scratch.data(), req->op_in, op_sz);
+    if (first_arg_sz)
+        std::memcpy(e.body_scratch.data(), req->op_in, first_arg_sz);
     if (payload_sz)
-        std::memcpy(e.body_scratch.data() + op_sz,
+        std::memcpy(e.body_scratch.data() + first_arg_sz,
                     e.buf + sizeof(::fuse_uring_req_header),
                     payload_sz);
-
-    // The header gets clobbered by the reply; copy out anything we
-    // still need from it before dispatch.
-    ::fuse_in_header h_copy = *h;
 
     Replier r;
     r.out    = e.buf + sizeof(::fuse_uring_req_header);
