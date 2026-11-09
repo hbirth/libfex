@@ -25,6 +25,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>     // std::getenv
@@ -566,6 +567,27 @@ public:
         return static_cast<std::size_t>(r);
     }
 
+    // Zero copy: the session reads or writes the backing file itself. The
+    // backing file keeps its own size and times, io_done() has nothing to do.
+    std::expected<fex::IoTarget, fex::Errc>
+    io_target(const fex::Context&, fex::NodeId n, bool write, std::uint64_t off,
+              std::size_t len) override
+    {
+        trace("[fex] io_target node=%llu %s off=%llu size=%zu\n",
+              u64(n), write ? "write" : "read", (unsigned long long)off, len);
+        auto io = io_fd(n, fex::FileHandle{0}, write ? O_WRONLY : O_RDONLY);
+        if (!io) return std::unexpected{io.error()};
+        // The transfer outlives this call, it needs an fd of its own.
+        Fd owner = std::move(io->owner);
+        if (owner.get() < 0) {
+            int d = ::fcntl(io->fd, F_DUPFD_CLOEXEC, 0);
+            if (d < 0) return wrap_errno();
+            owner = Fd{d};
+        }
+        const int fd = owner.get();
+        return fex::IoTarget{fd, off, std::make_shared<Fd>(std::move(owner))};
+    }
+
     std::expected<fex::StatfsOut, fex::Errc>
     statfs(const fex::Context&, fex::NodeId n) override {
         trace("[fex] statfs node=%llu\n", u64(n));
@@ -868,6 +890,15 @@ void usage(const char* argv0) {
         "                     (default: realpath(<backing_dir>)). Lets a\n"
         "                     mount(8) helper preserve the device-arg the\n"
         "                     caller used, matching libfuse passthrough_ll.\n"
+        "  --max-write N      largest copied read or write in bytes, the\n"
+        "                     payload buffer size (default 1 MiB)\n"
+        "  --bufpool N        give each queue a pool of N payload buffers\n"
+        "                     instead of one per ring entry\n"
+        "  --zero-copy        reads and writes larger than --max-write go\n"
+        "                     between the caller's pages and the backing file\n"
+        "                     without a copy; needs --bufpool and root\n"
+        "  --max-io N         largest zero copy read or write in bytes\n"
+        "                     (default 8 MiB)\n"
         "  -h, --help         this help\n"
         "\n"
         "Default is to fork into the background once the mount is live,\n"
@@ -885,7 +916,37 @@ int main(int argc, char** argv)
 {
     bool        foreground      = false;
     const char* source_override = nullptr;
+    fex::SessionOptions opts;
+    std::size_t bufpool = 0;
     int  ai = 1;
+
+    // --name N or --name=N, a byte or buffer count.
+    const auto number = [&](std::string_view a, std::string_view name,
+                            std::size_t& dst, bool& bad) {
+        const char* v;
+        if (a == name) {
+            if (ai + 1 >= argc) {
+                std::fprintf(stderr, "%s requires an argument\n", argv[ai]);
+                bad = true;
+                return true;
+            }
+            v = argv[++ai];
+        } else if (a.size() > name.size() && a.starts_with(name) &&
+                   a[name.size()] == '=') {
+            v = argv[ai] + name.size() + 1;
+        } else {
+            return false;
+        }
+        char* end = nullptr;
+        const unsigned long long n = std::strtoull(v, &end, 0);
+        if (!*v || *end || n == 0) {
+            std::fprintf(stderr, "bad value for %.*s: %s\n",
+                         (int)name.size(), name.data(), v);
+            bad = true;
+        }
+        dst = static_cast<std::size_t>(n);
+        return true;
+    };
     for (; ai < argc; ++ai) {
         std::string_view a = argv[ai];
         if (a == "-f" || a == "--foreground") {
@@ -901,6 +962,13 @@ int main(int argc, char** argv)
             source_override = argv[++ai];
         } else if (a.substr(0, 9) == "--source=") {
             source_override = argv[ai] + 9;
+        } else if (a == "--zero-copy") {
+            opts.uring_zero_copy = true;
+        } else if (bool bad = false;
+                   number(a, "--max-write", opts.uring_payload_bytes, bad) ||
+                   number(a, "--max-io", opts.uring_max_io_bytes, bad) ||
+                   number(a, "--bufpool", bufpool, bad)) {
+            if (bad) return 2;
         } else if (!a.empty() && a.front() == '-') {
             std::fprintf(stderr, "unknown option: %s\n", argv[ai]);
             usage(argv[0]);
@@ -915,6 +983,16 @@ int main(int argc, char** argv)
     }
     const char* backing    = argv[ai];
     const char* mountpoint = argv[ai + 1];
+
+    if (bufpool > UINT_MAX) {
+        std::fprintf(stderr, "bad value for --bufpool: %zu\n", bufpool);
+        return 2;
+    }
+    opts.uring_bufpool_buffers = static_cast<unsigned>(bufpool);
+    if (opts.uring_zero_copy && !opts.uring_bufpool_buffers) {
+        std::fprintf(stderr, "--zero-copy needs --bufpool\n");
+        return 2;
+    }
 
     // The kernel already applied the caller's umask to the mode of a new
     // object and insists on that exact mode.
@@ -935,7 +1013,6 @@ int main(int argc, char** argv)
 
     PassthroughFs fs(Fd{rfd});
 
-    fex::SessionOptions opts;
     opts.mountpoint = mountpoint;
     opts.fsname     = "fex-passthrough";
     if (source_override) {
