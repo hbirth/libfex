@@ -104,12 +104,21 @@ void Session::Impl::handle_init(
     // Cap max_write / max_pages so a single request fits in one ring
     // entry's payload buffer. We negotiate this with the kernel so it
     // never sends a request larger than what a ring slot can hold.
-    info.max_write = std::min<std::uint32_t>(
-        info.max_write,
-        static_cast<std::uint32_t>(opts.uring_payload_bytes));
-    info.max_pages = static_cast<std::uint16_t>(std::min<std::size_t>(
-        info.max_pages,
-        (opts.uring_payload_bytes + 4095u) / 4096u));
+    // With zero copy what does not fit isn't copied, so the cap is the
+    // zero copy limit instead.
+    if (opts.uring_zero_copy) {
+        info.max_write = static_cast<std::uint32_t>(std::min<std::size_t>(
+            opts.uring_max_io_bytes, UINT32_MAX));
+        info.max_pages = static_cast<std::uint16_t>(std::min<std::size_t>(
+            (opts.uring_max_io_bytes + 4095u) / 4096u, UINT16_MAX));
+    } else {
+        info.max_write = std::min<std::uint32_t>(
+            info.max_write,
+            static_cast<std::uint32_t>(opts.uring_payload_bytes));
+        info.max_pages = static_cast<std::uint16_t>(std::min<std::size_t>(
+            info.max_pages,
+            (opts.uring_payload_bytes + 4095u) / 4096u));
+    }
 
     // The two flags fusex looks at, it requires both. max_write and
     // max_pages count without a flag.

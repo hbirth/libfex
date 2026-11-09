@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string_view>
 #include <system_error>
 
@@ -148,6 +149,15 @@ constexpr std::uint32_t kMkobjxTmpfile = 1U << 0;
 struct OpenOut {
     FileHandle    fh          = FileHandle{0};
     std::uint32_t open_flags  = 0;
+};
+
+// Zero copy (SessionOptions::uring_zero_copy): the file a read or write
+// goes to and the offset in it. `hold` keeps what owns `fd` alive until
+// io_done() has returned.
+struct IoTarget {
+    int                   fd     = -1;
+    std::uint64_t         offset = 0;
+    std::shared_ptr<void> hold;
 };
 
 // INIT negotiation. Daemons receive the kernel's announce and write back

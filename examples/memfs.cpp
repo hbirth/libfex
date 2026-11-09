@@ -78,6 +78,12 @@ struct Config {
     unsigned max_write = 0;
     unsigned threads = 0;
     unsigned queue_depth = 32;
+    // Buffers in each queue's pool, 0 for a payload area per entry.
+    unsigned bufpool = 0;
+    // Reads and writes above max_write go straight between the caller's
+    // pages and the memfd, up to max_io; 0 means what the kernel allows.
+    bool     zero_copy = false;
+    unsigned max_io = 0;
 };
 Config g_cfg;
 
@@ -359,9 +365,9 @@ public:
     }
 
     std::expected<void, fex::Errc> init(fex::InitInfo& info) override {
-        info.max_write = g_cfg.max_write;
-        info.max_pages = static_cast<std::uint16_t>(
-            std::min(g_cfg.max_write / kBlockSize, 65535u));
+        const unsigned io = g_cfg.zero_copy ? g_cfg.max_io : g_cfg.max_write;
+        info.max_write = io;
+        info.max_pages = static_cast<std::uint16_t>(std::min(io / kBlockSize, 65535u));
         if (on_init)
             on_init();
         return {};
@@ -639,6 +645,35 @@ public:
         }
         in->touch_modified();
         return done;
+    }
+
+    // Zero copy: the memfd takes the data itself, the session moves it.
+    std::expected<fex::IoTarget, fex::Errc>
+    io_target(const fex::Context&, fex::NodeId n, bool write, std::uint64_t off,
+              std::size_t len) override {
+        log_io(write ? "WRZC" : "RDZC", n, off, len);
+        InodePtr in = get(n);
+        if (!in)
+            return error(ESTALE);
+        if (!in->is_reg())
+            return error(EISDIR);
+        // No memfd to move the data to.
+        if (g_cfg.null_io)
+            return error(EOPNOTSUPP);
+        const int fd = in->fd;
+        return fex::IoTarget{fd, off, std::move(in)};
+    }
+
+    void io_done(const fex::Context&, fex::NodeId, bool write, std::uint64_t,
+                 std::expected<std::size_t, fex::Errc> result,
+                 const fex::IoTarget& target) noexcept override {
+        if (!result)
+            return;
+        auto* in = static_cast<Inode*>(target.hold.get());
+        if (write)
+            in->touch_modified();
+        else
+            in->touch_atime();
     }
 
     std::expected<void, fex::Errc>
@@ -1005,6 +1040,13 @@ void usage(const char* argv0) {
         "  -o threads=N            ring worker threads (default: one per CPU, at\n"
         "                          most 32)\n"
         "  -o queue_depth=N        ring entries per queue (default 32)\n"
+        "  -o bufpool=N            give each queue a pool of N buffers of max_write\n"
+        "                          bytes instead of one per ring entry\n"
+        "  -o zero_copy            reads and writes larger than max_write go\n"
+        "                          between the caller's pages and the memfd without\n"
+        "                          a copy; needs bufpool and root\n"
+        "  -o max_io=N             largest zero copy read or write in bytes\n"
+        "                          (default: the max_pages_limit ceiling)\n"
         "  -o null_io              no data store, to measure the interface: writes\n"
         "                          read the buffer, reads return random data, files\n"
         "                          only remember their size\n"
@@ -1057,6 +1099,12 @@ bool parse_options(std::string_view list) {
             good = number(g_cfg.threads);
         } else if (key == "queue_depth") {
             good = number(g_cfg.queue_depth);
+        } else if (key == "bufpool") {
+            good = number(g_cfg.bufpool);
+        } else if (key == "zero_copy") {
+            g_cfg.zero_copy = good = true;
+        } else if (key == "max_io") {
+            good = number(g_cfg.max_io);
         } else {
             std::fprintf(stderr, "unknown option: %.*s\n", (int)opt.size(), opt.data());
             good = false;
@@ -1108,6 +1156,13 @@ int main(int argc, char** argv)
         g_cfg.max_write = max_write_ceiling();
     // Whole pages, at least one: a READLINK needs that much in a ring entry.
     g_cfg.max_write = std::max((g_cfg.max_write + kBlockSize - 1) / kBlockSize, 1u) * kBlockSize;
+    if (g_cfg.max_io == 0)
+        g_cfg.max_io = max_write_ceiling();
+    g_cfg.max_io = std::max(g_cfg.max_io / kBlockSize * kBlockSize, g_cfg.max_write);
+    if (g_cfg.zero_copy && (!g_cfg.bufpool || g_cfg.null_io)) {
+        std::fprintf(stderr, "zero_copy needs bufpool and a data store\n");
+        return 2;
+    }
 
     if (g_cfg.null_io) {
         g_null_buf.resize(kNullBufSize);
@@ -1132,6 +1187,9 @@ int main(int argc, char** argv)
     opts.uring_threads       = g_cfg.threads;
     opts.uring_queue_depth   = std::max(g_cfg.queue_depth, 1u);
     opts.uring_payload_bytes = g_cfg.max_write;
+    opts.uring_bufpool_buffers = g_cfg.bufpool;
+    opts.uring_zero_copy     = g_cfg.zero_copy;
+    opts.uring_max_io_bytes  = g_cfg.max_io;
 
     fex::Session session(std::move(opts));
     fex_example::install_signal_handlers(session);

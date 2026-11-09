@@ -210,6 +210,28 @@ public:
         return std::unexpected{Errc::function_not_supported};
     }
 
+    // Zero copy (SessionOptions::uring_zero_copy): a read or write too large
+    // for a payload buffer never passes through the daemon's memory. Name
+    // the file and offset its `len` bytes at `offset` go to or come from;
+    // the session moves them with io_uring between that file and the
+    // caller's pages, then calls io_done(). An error is the reply.
+    virtual std::expected<IoTarget, Errc>
+    io_target(const Context& ctx, NodeId nodeid, bool write,
+              std::uint64_t offset, std::size_t len) {
+        (void)ctx; (void)nodeid; (void)write; (void)offset; (void)len;
+        return std::unexpected{Errc::function_not_supported};
+    }
+
+    // After a zero copy transfer from io_target(). `result` is the byte
+    // count or the error, the reply read() or write() would have given.
+    // Times, and a size the file does not track itself, are updated here.
+    virtual void
+    io_done(const Context& ctx, NodeId nodeid, bool write, std::uint64_t offset,
+            std::expected<std::size_t, Errc> result, const IoTarget& target) noexcept {
+        (void)ctx; (void)nodeid; (void)write; (void)offset; (void)result;
+        (void)target;
+    }
+
     // FUSE_FALLOCATE (opcode 43). The fusex kernel filters modes to
     // KEEP_SIZE|PUNCH_HOLE|ZERO_RANGE before forwarding.
     virtual std::expected<void, Errc>

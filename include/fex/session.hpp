@@ -115,6 +115,22 @@ struct SessionOptions {
     // daemon will accept. The INIT handler advertises max_pages such
     // that one request fits in this many bytes.
     std::size_t uring_payload_bytes = 1u << 20;   // 1 MiB
+
+    // Buffer pool. 0 gives every entry a payload area of its own.
+    // Otherwise each queue has a pool of this many buffers of
+    // `uring_payload_bytes`, and a request holds one only while it is in
+    // the daemon, and only if it carries data. The pool is registered with
+    // io_uring when RLIMIT_MEMLOCK allows, which saves the kernel pinning
+    // it on every request.
+    unsigned uring_bufpool_buffers = 0;
+
+    // Zero copy. Needs a buffer pool, CAP_SYS_ADMIN and
+    // Filesystem::io_target(). A read or write larger than
+    // `uring_payload_bytes` goes between the caller's pages and the file
+    // io_target() names, the daemon never sees its bytes. The largest
+    // single READ/WRITE becomes `uring_max_io_bytes`.
+    bool        uring_zero_copy    = false;
+    std::size_t uring_max_io_bytes = 8u << 20;    // 8 MiB
 };
 
 class Session {
