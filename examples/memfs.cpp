@@ -9,9 +9,11 @@
 // The fusex counterpart of libfuse's example/memfs_ll.cc. Nothing is left when
 // the daemon ends.
 //
-// Data: a regular file's data lives in a memfd, which makes it sparse and
-// swappable and leaves the concurrency of reads and writes to the kernel. That
-// takes one file descriptor per regular file.
+// Data: a regular file's data lives in the daemon's memory, in chunks mapped
+// as they are first written, which makes it sparse. Reads and writes of a file
+// run side by side; only truncate and fallocate wait for them (Data). Zero copy
+// needs a file for io_uring to move the data to, it goes through a staging
+// memfd of its own per transfer (Staging).
 //
 // Inode lifetime: `nlookup` counts what the kernel has been told minus what it
 // has forgotten, `nlink` counts the names. An inode goes when both are zero:
@@ -20,7 +22,7 @@
 //
 // Locking: ns_mu_ protects the namespace, which is the inode table, the
 // directories and `parent`. Inode::attr_mu protects the attributes and xattrs,
-// and is taken inside ns_mu_. A last reference can close a memfd full of data:
+// and is taken inside ns_mu_. A last reference can unmap a file full of data:
 // that is done after dropping ns_mu_, which is why the InodePtrs of the
 // operations that remove something are declared before the lock.
 
@@ -81,9 +83,12 @@ struct Config {
     // Buffers in each queue's pool, 0 for a payload area per entry.
     unsigned bufpool = 0;
     // Reads and writes above max_write go straight between the caller's
-    // pages and the memfd, up to max_io; 0 means what the kernel allows.
+    // pages and a staging memfd, up to max_io; 0 means what the kernel allows.
     bool     zero_copy = false;
     unsigned max_io = 0;
+    // Raise /proc/sys/fs/fuse/max_pages_limit to this before anything is
+    // sized from it, 0 to leave it alone.
+    unsigned max_pages_limit = 0;
 };
 Config g_cfg;
 
@@ -128,6 +133,291 @@ fex::Timespec now() {
     return {ts.tv_sec, static_cast<std::uint32_t>(ts.tv_nsec)};
 }
 
+const std::size_t g_page_size = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+
+// The data of a regular file, in chunks of anonymous memory mapped when
+// something is first written into them. Reads and writes share mu_, so they go
+// on side by side; what grows the chunk table or drops chunks takes it alone.
+// Bytes past the size are zero, which is what extending the file shows.
+class Data {
+public:
+    static constexpr unsigned    kChunkShift = 21;
+    static constexpr std::size_t kChunkSize  = std::size_t{1} << kChunkShift;
+
+    Data() = default;
+    Data(const Data&)            = delete;
+    Data& operator=(const Data&) = delete;
+
+    ~Data() {
+        for (std::size_t i = 0; i < nchunks_; ++i)
+            unmap(i);
+    }
+
+    std::uint64_t size() const { return size_.load(std::memory_order_acquire); }
+
+    // In 512 byte units. Pages of a chunk are only there once touched, so a
+    // file below the chunk size counts by its size.
+    std::uint64_t blocks() const {
+        const std::uint64_t mapped = mapped_.load(std::memory_order_relaxed) << kChunkShift;
+        const std::uint64_t used   = (size() + kBlockSize - 1) / kBlockSize * kBlockSize;
+        return std::min(mapped, used) / 512;
+    }
+
+    std::size_t read(std::uint64_t off, std::span<std::byte> out) const {
+        std::shared_lock lk(mu_);
+        const std::uint64_t end = size();
+        if (off >= end)
+            return 0;
+        const std::size_t len = std::min<std::uint64_t>(out.size(), end - off);
+        for_each_chunk(off, len, [&](std::size_t idx, std::size_t in, std::size_t pos,
+                                     std::size_t n) {
+            const std::byte* c = idx < nchunks_ ? chunks_[idx].load(std::memory_order_acquire)
+                                                : nullptr;
+            if (c)
+                std::memcpy(out.data() + pos, c + in, n);
+            else
+                std::memset(out.data() + pos, 0, n);
+        });
+        return len;
+    }
+
+    std::expected<void, fex::Errc> write(std::uint64_t off, std::span<const std::byte> data) {
+        const std::uint64_t end = off + data.size();
+        std::shared_lock<std::shared_mutex> lk;
+        if (!lock_table(lk, end))
+            return error(ENOSPC);
+        bool mapped = true;
+        for_each_chunk(off, data.size(), [&](std::size_t idx, std::size_t in, std::size_t pos,
+                                             std::size_t n) {
+            std::byte* c = mapped ? chunk(idx) : nullptr;
+            if (!c) {
+                mapped = false;
+                return;
+            }
+            std::memcpy(c + in, data.data() + pos, n);
+        });
+        if (!mapped)
+            return error(ENOSPC);
+        grow_size(end);
+        return {};
+    }
+
+    // Maps the chunks of [off, off + len), and makes that the size unless
+    // `keep_size`.
+    std::expected<void, fex::Errc> allocate(std::uint64_t off, std::uint64_t len, bool keep_size) {
+        const std::uint64_t end = off + len;
+        std::shared_lock<std::shared_mutex> lk;
+        if (!lock_table(lk, end))
+            return error(ENOSPC);
+        for (std::uint64_t idx = off >> kChunkShift; len && idx <= (end - 1) >> kChunkShift; ++idx) {
+            if (!chunk(idx))
+                return error(ENOSPC);
+        }
+        if (!keep_size)
+            grow_size(end);
+        return {};
+    }
+
+    void truncate(std::uint64_t new_size) {
+        std::unique_lock lk(mu_);
+        const std::uint64_t old = size();
+        if (new_size < old) {
+            const std::size_t keep = chunks_for(new_size);
+            for (std::size_t i = keep; i < nchunks_; ++i)
+                unmap(i);
+            if ((new_size & (kChunkSize - 1)) && keep <= nchunks_)
+                zero(keep - 1, new_size & (kChunkSize - 1), kChunkSize);
+        }
+        size_.store(new_size, std::memory_order_release);
+    }
+
+    // Zeroes [off, off + len) and drops the chunks it covers whole.
+    void punch(std::uint64_t off, std::uint64_t len) {
+        std::unique_lock lk(mu_);
+        const std::uint64_t end = std::min<std::uint64_t>(off + len, std::uint64_t{nchunks_} << kChunkShift);
+        if (off >= end)
+            return;
+        for_each_chunk(off, end - off, [&](std::size_t idx, std::size_t in, std::size_t,
+                                           std::size_t n) {
+            if (n == kChunkSize)
+                unmap(idx);
+            else
+                zero(idx, in, in + n);
+        });
+    }
+
+private:
+    static std::size_t chunks_for(std::uint64_t size) {
+        return static_cast<std::size_t>((size + kChunkSize - 1) >> kChunkShift);
+    }
+
+    // Calls f(chunk index, offset in the chunk, offset in the buffer, length)
+    // for the pieces of [off, off + len).
+    template <typename F>
+    static void for_each_chunk(std::uint64_t off, std::size_t len, F&& f) {
+        for (std::size_t pos = 0; pos < len; ) {
+            const std::uint64_t at = off + pos;
+            const std::size_t   in = static_cast<std::size_t>(at & (kChunkSize - 1));
+            const std::size_t   n  = std::min(len - pos, kChunkSize - in);
+            f(static_cast<std::size_t>(at >> kChunkShift), in, pos, n);
+            pos += n;
+        }
+    }
+
+    // Takes mu_ shared with the table long enough for `end`. False when the
+    // table can't grow that far.
+    bool lock_table(std::shared_lock<std::shared_mutex>& lk, std::uint64_t end) {
+        const std::uint64_t need = (end + kChunkSize - 1) >> kChunkShift;
+        for (;;) {
+            lk = std::shared_lock(mu_);
+            if (need <= nchunks_)
+                return true;
+            lk.unlock();
+
+            std::unique_lock ex(mu_);
+            if (need <= nchunks_)
+                continue;
+            const std::size_t n = std::max<std::uint64_t>(need, std::uint64_t{nchunks_} * 2);
+            std::unique_ptr<std::atomic<std::byte*>[]> table{
+                new (std::nothrow) std::atomic<std::byte*>[n]};
+            if (!table)
+                return false;
+            for (std::size_t i = 0; i < n; ++i)
+                table[i].store(i < nchunks_ ? chunks_[i].load(std::memory_order_relaxed) : nullptr,
+                               std::memory_order_relaxed);
+            chunks_  = std::move(table);
+            nchunks_ = n;
+        }
+    }
+
+    // Under mu_ shared, the table long enough: the chunk, mapped if it wasn't.
+    std::byte* chunk(std::size_t idx) {
+        std::byte* c = chunks_[idx].load(std::memory_order_acquire);
+        if (c)
+            return c;
+        void* p = ::mmap(nullptr, kChunkSize, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p == MAP_FAILED)
+            return nullptr;
+        // Another writer can have been first.
+        if (!chunks_[idx].compare_exchange_strong(c, static_cast<std::byte*>(p),
+                                                  std::memory_order_acq_rel)) {
+            ::munmap(p, kChunkSize);
+            return c;
+        }
+        mapped_.fetch_add(1, std::memory_order_relaxed);
+        return static_cast<std::byte*>(p);
+    }
+
+    // Under mu_ alone.
+    void unmap(std::size_t idx) {
+        if (std::byte* c = chunks_[idx].exchange(nullptr, std::memory_order_relaxed)) {
+            ::munmap(c, kChunkSize);
+            mapped_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    // Under mu_ alone: zeroes [from, to) of a chunk, giving back whole pages.
+    void zero(std::size_t idx, std::size_t from, std::size_t to) {
+        std::byte* c = chunks_[idx].load(std::memory_order_relaxed);
+        if (!c)
+            return;
+        const std::size_t a = (from + g_page_size - 1) / g_page_size * g_page_size;
+        const std::size_t b = to / g_page_size * g_page_size;
+        if (a >= b) {
+            std::memset(c + from, 0, to - from);
+            return;
+        }
+        std::memset(c + from, 0, a - from);
+        // A private anonymous page reads as zeros after this.
+        ::madvise(c + a, b - a, MADV_DONTNEED);
+        std::memset(c + b, 0, to - b);
+    }
+
+    void grow_size(std::uint64_t end) {
+        std::uint64_t cur = size_.load(std::memory_order_relaxed);
+        while (end > cur &&
+               !size_.compare_exchange_weak(cur, end, std::memory_order_release,
+                                            std::memory_order_relaxed))
+            ;
+    }
+
+    mutable std::shared_mutex                  mu_;
+    std::unique_ptr<std::atomic<std::byte*>[]> chunks_;
+    std::size_t                                nchunks_ = 0;
+    std::atomic<std::uint64_t>                 size_{0};
+    std::atomic<std::uint64_t>                 mapped_{0};
+};
+
+// Zero copy moves data between the caller's pages and a file. Each transfer in
+// flight gets a memfd of its own from here, so no two wait for the same memfd's
+// inode lock, and the memfds keep their pages for the next one. io_target() and
+// io_done() copy between the memfd and the file's Data; a server that keeps its
+// data elsewhere would send it on from there instead.
+class Staging {
+public:
+    struct Buf {
+        int        fd;
+        std::byte* map;
+    };
+
+    explicit Staging(std::size_t size) : size_(size) {}
+
+    Staging(const Staging&)            = delete;
+    Staging& operator=(const Staging&) = delete;
+
+    ~Staging() {
+        for (Buf* b : all_) {
+            ::munmap(b->map, size_);
+            ::close(b->fd);
+            delete b;
+        }
+    }
+
+    std::size_t size() const { return size_; }
+
+    std::expected<Buf*, fex::Errc> get() {
+        {
+            std::lock_guard lk(mu_);
+            if (!free_.empty()) {
+                Buf* b = free_.back();
+                free_.pop_back();
+                return b;
+            }
+        }
+        const int fd = ::memfd_create("fex-memfs-staging", MFD_CLOEXEC | MFD_NOEXEC_SEAL);
+        if (fd < 0)
+            return last_error();
+        if (::ftruncate(fd, static_cast<off_t>(size_)) < 0) {
+            const int e = errno;
+            ::close(fd);
+            return error(e);
+        }
+        void* p = ::mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED) {
+            const int e = errno;
+            ::close(fd);
+            return error(e);
+        }
+        auto* b = new Buf{fd, static_cast<std::byte*>(p)};
+        std::lock_guard lk(mu_);
+        all_.push_back(b);
+        free_.reserve(all_.size());
+        return b;
+    }
+
+    void put(Buf* b) noexcept {
+        std::lock_guard lk(mu_);
+        free_.push_back(b);
+    }
+
+private:
+    const std::size_t size_;
+    std::mutex        mu_;
+    std::vector<Buf*> all_;
+    std::vector<Buf*> free_;   // as many as all_, reserved there
+};
+
 class Inode;
 using InodePtr = std::shared_ptr<Inode>;
 
@@ -141,16 +431,12 @@ public:
     using Children = std::unordered_map<std::string, Dentry>;
 
     Inode(std::uint64_t ino, std::uint16_t full_mode, std::uint32_t owner, std::uint32_t group,
-          std::uint32_t major, std::uint32_t minor, std::string link, int memfd)
-        : id(ino), type(full_mode & S_IFMT), fd(memfd), rdev_major(major), rdev_minor(minor),
-          target(std::move(link)), mode_(full_mode), uid_(owner), gid_(group)
+          std::uint32_t major, std::uint32_t minor, std::string link,
+          std::unique_ptr<Data> file_data)
+        : id(ino), type(full_mode & S_IFMT), data(std::move(file_data)), rdev_major(major),
+          rdev_minor(minor), target(std::move(link)), mode_(full_mode), uid_(owner), gid_(group)
     {
         atime_ = mtime_ = ctime_ = btime_ = now();
-    }
-
-    ~Inode() {
-        if (fd >= 0)
-            ::close(fd);
     }
 
     Inode(const Inode&)            = delete;
@@ -167,12 +453,9 @@ public:
         out.nlink      = nlink.load(std::memory_order_relaxed);
         out.rdev_major = rdev_major;
         out.rdev_minor = rdev_minor;
-        if (fd >= 0) {
-            struct ::stat st;
-            if (::fstat(fd, &st) == 0) {
-                out.size   = static_cast<std::uint64_t>(st.st_size);
-                out.blocks = static_cast<std::uint64_t>(st.st_blocks);
-            }
+        if (data) {
+            out.size   = data->size();
+            out.blocks = data->blocks();
         } else if (is_reg()) {
             out.size   = null_size.load(std::memory_order_relaxed);
             out.blocks = (out.size + 511) / 512;
@@ -310,7 +593,7 @@ public:
 
     const std::uint64_t id;
     const std::uint16_t type;
-    const int           fd;     // the memfd of a regular file, -1 otherwise and under null_io
+    const std::unique_ptr<Data> data;   // of a regular file, none otherwise and under null_io
     const std::uint32_t rdev_major, rdev_minor;
     const std::string   target; // of a symlink
 
@@ -343,9 +626,11 @@ public:
     std::function<void()> on_init;
 
     MemFs() {
+        if (g_cfg.zero_copy)
+            staging_ = std::make_unique<Staging>(g_cfg.max_io);
         auto root = std::make_shared<Inode>(fex::to_underlying(fex::NodeId::root),
                                             S_IFDIR | 0755, ::getuid(), ::getgid(),
-                                            0, 0, std::string{}, -1);
+                                            0, 0, std::string{}, nullptr);
         root->parent = root->id;
         root->nlink = 2;
         // The kernel has it from the mount on, and never forgets it in time.
@@ -435,8 +720,8 @@ public:
                 return error(EINVAL);
             if (g_cfg.null_io)
                 in->null_size = attrs.size;
-            else if (::ftruncate(in->fd, static_cast<off_t>(attrs.size)) < 0)
-                return last_error();
+            else
+                in->data->truncate(attrs.size);
         }
         in->apply(attrs);
         return in->stat();
@@ -615,10 +900,7 @@ public:
         if (g_cfg.null_io) {
             done = null_read(*in, off, out);
         } else {
-            const ssize_t r = ::pread(in->fd, out.data(), out.size(), static_cast<off_t>(off));
-            if (r < 0)
-                return last_error();
-            done = static_cast<std::size_t>(r);
+            done = in->data->read(off, out);
         }
         in->touch_atime();
         return done;
@@ -638,16 +920,16 @@ public:
         if (g_cfg.null_io) {
             done = null_write(*in, off, data);
         } else {
-            const ssize_t r = ::pwrite(in->fd, data.data(), data.size(), static_cast<off_t>(off));
-            if (r < 0)
-                return last_error();
-            done = static_cast<std::size_t>(r);
+            if (auto r = in->data->write(off, data); !r)
+                return std::unexpected{r.error()};
+            done = data.size();
         }
         in->touch_modified();
         return done;
     }
 
-    // Zero copy: the memfd takes the data itself, the session moves it.
+    // Zero copy: the session moves the data between the caller's pages and a
+    // staging memfd, this copies it between there and the file.
     std::expected<fex::IoTarget, fex::Errc>
     io_target(const fex::Context&, fex::NodeId n, bool write, std::uint64_t off,
               std::size_t len) override {
@@ -657,23 +939,41 @@ public:
             return error(ESTALE);
         if (!in->is_reg())
             return error(EISDIR);
-        // No memfd to move the data to.
-        if (g_cfg.null_io)
+        // No data store to move the data to.
+        if (g_cfg.null_io || !staging_)
             return error(EOPNOTSUPP);
-        const int fd = in->fd;
-        return fex::IoTarget{fd, off, std::move(in)};
+        if (len > staging_->size())
+            return error(EIO);
+
+        // Mapped now, so that the copy in io_done() has nowhere to fail.
+        if (write) {
+            if (auto r = in->data->allocate(off, len, true); !r)
+                return std::unexpected{r.error()};
+        }
+        auto buf = staging_->get();
+        if (!buf)
+            return std::unexpected{buf.error()};
+        fex::IoTarget target{(*buf)->fd, 0, std::make_shared<ZeroCopy>(*staging_, *buf, in)};
+        if (!write)
+            target.len = in->data->read(off, {(*buf)->map, len});
+        return target;
     }
 
-    void io_done(const fex::Context&, fex::NodeId, bool write, std::uint64_t,
+    void io_done(const fex::Context&, fex::NodeId n, bool write, std::uint64_t off,
                  std::expected<std::size_t, fex::Errc> result,
                  const fex::IoTarget& target) noexcept override {
         if (!result)
             return;
-        auto* in = static_cast<Inode*>(target.hold.get());
-        if (write)
-            in->touch_modified();
-        else
-            in->touch_atime();
+        auto* zc = static_cast<ZeroCopy*>(target.hold.get());
+        if (!write) {
+            zc->in->touch_atime();
+            return;
+        }
+        // Can fail only if a truncate dropped the chunks in between.
+        if (!zc->in->data->write(off, {zc->buf->map, *result}))
+            std::fprintf(stderr, "fex-memfs: zero copy write to ino %llu lost: out of memory\n",
+                         (unsigned long long)fex::to_underlying(n));
+        zc->in->touch_modified();
     }
 
     std::expected<void, fex::Errc>
@@ -689,19 +989,14 @@ public:
             if (!(mode & FALLOC_FL_KEEP_SIZE))
                 grow_null_size(*in, off + len);
         } else {
-            const auto start = static_cast<off_t>(off), length = static_cast<off_t>(len);
-            const int keep = static_cast<int>(mode & FALLOC_FL_KEEP_SIZE);
-            int r;
-            if (mode & FALLOC_FL_ZERO_RANGE) {
-                // shmem has no such mode: a hole, then allocated again.
-                r = ::fallocate(in->fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, start, length);
-                if (r == 0)
-                    r = ::fallocate(in->fd, keep, start, length);
-            } else {
-                r = ::fallocate(in->fd, static_cast<int>(mode), start, length);
+            const bool keep = mode & FALLOC_FL_KEEP_SIZE;
+            if (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE))
+                in->data->punch(off, len);
+            // A punched hole stays one, a zeroed range is allocated again.
+            if (!(mode & FALLOC_FL_PUNCH_HOLE)) {
+                if (auto r = in->data->allocate(off, len, keep); !r)
+                    return std::unexpected{r.error()};
             }
-            if (r < 0)
-                return last_error();
         }
         in->touch_modified();
         return {};
@@ -737,11 +1032,9 @@ public:
         out.bfree   = si.freeram * unit / kBlockSize;
         out.bavail  = out.bfree;
 
-        // A regular file takes a file descriptor.
-        struct rlimit rl{};
-        (void)::getrlimit(RLIMIT_NOFILE, &rl);
+        // At most one inode per block.
         std::shared_lock lk(ns_mu_);
-        out.files = rl.rlim_cur;
+        out.files = out.blocks;
         out.ffree = out.files - std::min<std::uint64_t>(out.files, inodes_.size());
         return out;
     }
@@ -827,19 +1120,15 @@ private:
         return find(n);
     }
 
-    // Not under ns_mu_: this can create a memfd.
     std::expected<InodePtr, fex::Errc>
     new_inode(std::uint16_t mode, std::uint32_t uid, std::uint32_t gid,
               std::uint32_t rdev_major, std::uint32_t rdev_minor, std::string target) {
-        int fd = -1;
-        if (S_ISREG(mode) && !g_cfg.null_io) {
-            fd = ::memfd_create("fex-memfs", MFD_CLOEXEC | MFD_NOEXEC_SEAL);
-            if (fd < 0)
-                return error(errno == EMFILE || errno == ENFILE ? ENOSPC : errno);
-        }
+        std::unique_ptr<Data> data;
+        if (S_ISREG(mode) && !g_cfg.null_io)
+            data = std::make_unique<Data>();
         return std::make_shared<Inode>(next_id_.fetch_add(1, std::memory_order_relaxed),
                                        mode, uid, gid, rdev_major, rdev_minor,
-                                       std::move(target), fd);
+                                       std::move(target), std::move(data));
     }
 
     // A directory changing parents takes its ".." with it.
@@ -921,6 +1210,18 @@ private:
         return data.size();
     }
 
+    // A zero copy transfer in flight: its staging memfd and the file.
+    struct ZeroCopy {
+        ZeroCopy(Staging& s, Staging::Buf* b, InodePtr file)
+            : staging(s), buf(b), in(std::move(file)) {}
+        ~ZeroCopy() { staging.put(buf); }
+
+        Staging&      staging;
+        Staging::Buf* buf;
+        InodePtr      in;
+    };
+
+    std::unique_ptr<Staging> staging_;
     mutable std::shared_mutex ns_mu_;
     std::unordered_map<std::uint64_t, InodePtr> inodes_;
     std::atomic<std::uint64_t> next_id_{fex::to_underlying(fex::NodeId::root) + 1};
@@ -1012,10 +1313,36 @@ private:
     bool                    stop_ = false;
 };
 
+constexpr const char* kMaxPagesLimit = "/proc/sys/fs/fuse/max_pages_limit";
+
+// Never lowers it: other fuse mounts may be sized from the current value.
+bool raise_max_pages_limit(unsigned pages) {
+    pages = std::min(pages, 65535u);
+    unsigned cur = 0;
+    if (FILE* f = std::fopen(kMaxPagesLimit, "re")) {
+        if (std::fscanf(f, "%u", &cur) != 1)
+            cur = 0;
+        std::fclose(f);
+    }
+    if (cur >= pages)
+        return true;
+    FILE* f = std::fopen(kMaxPagesLimit, "we");
+    if (!f) {
+        std::fprintf(stderr, "%s: %s\n", kMaxPagesLimit, std::strerror(errno));
+        return false;
+    }
+    const bool ok = std::fprintf(f, "%u\n", pages) > 0;
+    if (std::fclose(f) != 0 || !ok) {
+        std::fprintf(stderr, "%s: %s\n", kMaxPagesLimit, std::strerror(errno));
+        return false;
+    }
+    return true;
+}
+
 // What the kernel allows: fuse_init_out.max_pages is a u16.
 unsigned max_write_ceiling() {
     unsigned pages = 0;
-    if (FILE* f = std::fopen("/proc/sys/fs/fuse/max_pages_limit", "re")) {
+    if (FILE* f = std::fopen(kMaxPagesLimit, "re")) {
         if (std::fscanf(f, "%u", &pages) != 1)
             pages = 0;
         std::fclose(f);
@@ -1043,10 +1370,13 @@ void usage(const char* argv0) {
         "  -o bufpool=N            give each queue a pool of N buffers of max_write\n"
         "                          bytes instead of one per ring entry\n"
         "  -o zero_copy            reads and writes larger than max_write go\n"
-        "                          between the caller's pages and the memfd without\n"
-        "                          a copy; needs bufpool and root\n"
+        "                          between the caller's pages and a staging memfd\n"
+        "                          without a copy; needs bufpool and root\n"
         "  -o max_io=N             largest zero copy read or write in bytes\n"
         "                          (default: the max_pages_limit ceiling)\n"
+        "  -o max_pages_limit=N    raise /proc/sys/fs/fuse/max_pages_limit to N\n"
+        "                          pages (at most 65535) before sizing anything\n"
+        "                          from it; never lowers it; needs root\n"
         "  -o null_io              no data store, to measure the interface: writes\n"
         "                          read the buffer, reads return random data, files\n"
         "                          only remember their size\n"
@@ -1105,6 +1435,8 @@ bool parse_options(std::string_view list) {
             g_cfg.zero_copy = good = true;
         } else if (key == "max_io") {
             good = number(g_cfg.max_io);
+        } else if (key == "max_pages_limit") {
+            good = number(g_cfg.max_pages_limit);
         } else {
             std::fprintf(stderr, "unknown option: %.*s\n", (int)opt.size(), opt.data());
             good = false;
@@ -1152,6 +1484,8 @@ int main(int argc, char** argv)
     }
     const char* mountpoint = argv[ai];
 
+    if (g_cfg.max_pages_limit && !raise_max_pages_limit(g_cfg.max_pages_limit))
+        return 1;
     if (g_cfg.max_write == 0)
         g_cfg.max_write = max_write_ceiling();
     // Whole pages, at least one: a READLINK needs that much in a ring entry.
@@ -1171,7 +1505,7 @@ int main(int argc, char** argv)
             byte = static_cast<std::byte>(rng());
     }
 
-    // One memfd per regular file.
+    // A staging memfd per zero copy transfer in flight.
     struct rlimit rl;
     if (::getrlimit(RLIMIT_NOFILE, &rl) == 0) {
         rl.rlim_cur = rl.rlim_max;

@@ -148,8 +148,11 @@ build/fex-memfs /tmp/mnt       # -f to stay in the foreground
 ```
 
 `fex-memfs` is the counterpart of libfuse's `memfs_ll`: everything lives in
-the daemon and is gone when it ends. The data of a regular file is in a memfd,
-so it is sparse and swappable, and takes one file descriptor per file. It does
+the daemon and is gone when it ends. The data of a regular file is in the
+daemon's memory, in chunks mapped as they are first written, so it is sparse;
+reads and writes of one file don't wait for each other. Zero copy (`zero_copy`)
+moves the data through a staging memfd per transfer, where a real server would
+send it on to its store. It does
 what the kernel asks of a daemon: directories, hard links and symlinks, special
 files, `O_TMPFILE`, all the `RENAME_*` flags, xattrs and so ACLs, `fallocate`,
 and the timestamps. `df` shows the machine's memory.
