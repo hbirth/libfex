@@ -9,6 +9,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -153,11 +154,13 @@ struct OpenOut {
 
 // Zero copy (SessionOptions::uring_zero_copy): the file a read or write
 // goes to and the offset in it. `hold` keeps what owns `fd` alive until
-// io_done() has returned.
+// io_done() has returned. `len` caps the transfer below what was asked,
+// for a read that ends at EOF.
 struct IoTarget {
     int                   fd     = -1;
     std::uint64_t         offset = 0;
     std::shared_ptr<void> hold;
+    std::size_t           len    = SIZE_MAX;
 };
 
 // INIT negotiation. Daemons receive the kernel's announce and write back

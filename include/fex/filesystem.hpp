@@ -214,7 +214,8 @@ public:
     // for a payload buffer never passes through the daemon's memory. Name
     // the file and offset its `len` bytes at `offset` go to or come from;
     // the session moves them with io_uring between that file and the
-    // caller's pages, then calls io_done(). An error is the reply.
+    // caller's pages, then calls io_done(). An error is the reply. A read
+    // that ends at EOF says so in IoTarget::len, 0 at or past it.
     virtual std::expected<IoTarget, Errc>
     io_target(const Context& ctx, NodeId nodeid, bool write,
               std::uint64_t offset, std::size_t len) {

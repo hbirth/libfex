@@ -404,6 +404,16 @@ bool RingWorker::start_zero_copy(std::uint32_t i) noexcept
         return false;
     }
 
+    e.zc_write  = write;
+    e.zc_offset = offset;
+    len = std::min(len, target->len);
+    // A read at EOF: nothing to move.
+    if (len == 0) {
+        e.zc_target = std::move(*target);
+        finish_zero_copy(i, 0);
+        return false;
+    }
+
     io_uring_sqe* sqe = get_sqe();
     if (!sqe) {
         set_reply(e, h.unique, -EAGAIN, 0);
@@ -420,8 +430,6 @@ bool RingWorker::start_zero_copy(std::uint32_t i) noexcept
                                  zc_slot(i));
     io_uring_sqe_set_data64(sqe, kZeroCopyBit | make_ud(i));
 
-    e.zc_write  = write;
-    e.zc_offset = offset;
     e.zc_target = std::move(*target);
     return true;
 }
